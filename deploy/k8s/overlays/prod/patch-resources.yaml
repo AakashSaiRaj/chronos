@@ -1,0 +1,66 @@
+# Production resource requests.
+#
+# Requests are raised over the base because the HPA target is a percentage *of the
+# request*: too small a request means the autoscaler fires on noise, too large a
+# one means it never fires at all. These are starting points to be replaced with
+# Phase 4 measurements, not values anyone should trust yet.
+#
+# Memory limits stay set and CPU limits stay absent throughout. A memory leak must
+# be contained so it cannot evict neighbours; CPU throttling would only add latency
+# — and for a worker, throttling mid-activity pushes it toward its task timeout and
+# lease expiry, turning a busy pod into a failed task.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chronos-api
+  namespace: chronos
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chronos-scheduler
+  namespace: chronos
+spec:
+  template:
+    spec:
+      containers:
+        - name: scheduler
+          resources:
+            requests:
+              # A sweep is bounded by database round trips rather than local CPU,
+              # so the scheduler stays modest even at high execution volume.
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chronos-worker
+  namespace: chronos
+spec:
+  template:
+    spec:
+      containers:
+        - name: worker
+          resources:
+            requests:
+              # Eight concurrent activities per pod in prod, so the request is
+              # correspondingly larger. This is the denominator for the HPA's 70%
+              # CPU target.
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              memory: 1Gi

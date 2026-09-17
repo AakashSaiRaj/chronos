@@ -1,0 +1,44 @@
+# Production tuning.
+#
+# The connection-pool numbers are the ones to check before scaling anything: they
+# are per replica, so the real ceiling is
+#
+#   (api replicas + scheduler replicas) x CHRONOS_DB_MAX_CONNS
+#
+# which must stay comfortably under the database's max_connections (500 in
+# prod.tfvars). At 3 api + 2 scheduler x 25 that is 125, leaving room for the
+# migration Job, Performance Insights, and a human with psql.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chronos-config
+  namespace: chronos
+data:
+  CHRONOS_LOG_LEVEL: "info"
+  CHRONOS_DB_MAX_CONNS: "25"
+  CHRONOS_DB_MIN_CONNS: "5"
+
+  # Sweep slightly less often than dev. At production execution volumes each sweep
+  # does more work, and the nudge path already handles the latency-sensitive case:
+  # polling is the correctness mechanism, not the fast path.
+  CHRONOS_ENGINE_POLL_INTERVAL: "500ms"
+  CHRONOS_ENGINE_BATCH_SIZE: "500"
+
+  # Failure detection stays fast. This bounds how long a lost task waits before
+  # being reclaimed, which is user-visible latency after a node failure.
+  CHRONOS_REAPER_INTERVAL: "1s"
+  CHRONOS_REAPER_BATCH_SIZE: "200"
+  CHRONOS_WORKER_TIMEOUT: "45s"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chronos-worker-config
+  namespace: chronos
+data:
+  CHRONOS_LOG_LEVEL: "info"
+  CHRONOS_WORKER_CONCURRENCY: "8"
+  # A longer lease than dev, because production activities call real downstreams.
+  # The heartbeat still renews at a third of it, so detection stays fast regardless.
+  CHRONOS_WORKER_LEASE_DURATION: "60s"
+  CHRONOS_WORKER_HEARTBEAT_INTERVAL: "15s"

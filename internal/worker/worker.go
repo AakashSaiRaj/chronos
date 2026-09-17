@@ -24,6 +24,7 @@ type Worker struct {
 	client   *client.Client
 	registry *Registry
 	logger   *slog.Logger
+	health   *health
 
 	// id is assigned by the server at registration.
 	id uuid.UUID
@@ -41,7 +42,17 @@ func New(cfg config.Worker, c *client.Client, registry *Registry, logger *slog.L
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Worker{cfg: cfg, client: c, registry: registry, logger: logger}, nil
+	// A worker is unready if it has not had a successful poll in several poll
+	// intervals — long enough that an idle queue or a brief blip does not flap the
+	// readiness gate.
+	staleAfter := max(10*cfg.PollInterval, 30*time.Second)
+	return &Worker{
+		cfg:      cfg,
+		client:   c,
+		registry: registry,
+		logger:   logger,
+		health:   newHealth(staleAfter),
+	}, nil
 }
 
 // Run registers the worker and processes tasks until ctx is canceled.
@@ -57,6 +68,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		return fmt.Errorf("register worker %q: %w", w.cfg.Name, err)
 	}
 	w.id = registered.ID
+	w.health.markRegistered()
 
 	w.logger.Info("worker started",
 		"workerId", w.id,
@@ -67,7 +79,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 	var wg sync.WaitGroup
 
-	// Heartbeats are what Phase 2's failure detector uses to notice a dead
+	// Heartbeats are what the reaper's failure detector uses to notice a dead
 	// worker, so they run independently of task execution.
 	wg.Add(1)
 	go func() {
@@ -130,11 +142,14 @@ func (w *Worker) pollLoop(ctx context.Context, slot int) {
 			// Reset backoff: the queue has work, so poll again immediately
 			// after finishing rather than sleeping.
 			idleBackoff = w.cfg.PollInterval
+			w.health.markPolled()
 			w.execute(ctx, logger, task)
 			continue
 
 		case errors.Is(err, client.ErrNoTask):
-			// Idle queue is the normal case; wait before asking again.
+			// An idle queue is the normal case and still proves the control plane
+			// is reachable, so it counts as a successful poll for readiness.
+			w.health.markPolled()
 
 		case ctx.Err() != nil:
 			return

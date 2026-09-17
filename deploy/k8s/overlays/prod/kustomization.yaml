@@ -1,0 +1,44 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Production overlay.
+#
+# The differences from dev are all about surviving a failure rather than about
+# scale: three-way redundancy on the tiers whose loss stops work, real HPA
+# headroom, and a scale-down policy tuned to avoid abandoning in-flight tasks.
+
+namespace: chronos
+
+resources:
+  - ../../base
+  - ingress.yaml
+
+commonAnnotations:
+  chronos.io/environment: prod
+
+images:
+  - name: chronos
+    newName: 000000000000.dkr.ecr.us-east-1.amazonaws.com/chronos-prod
+    # Pinned by the deploy pipeline to an immutable digest-backed tag. Never
+    # "latest": a tag that can move makes a rollout non-reproducible and a
+    # rollback a guess.
+    newTag: PLACEHOLDER
+
+replicas:
+  - name: chronos-api
+    # Three, so losing one AZ still leaves two serving. Workers poll this tier
+    # continuously; a gap here is visible fleet-wide.
+    count: 3
+  - name: chronos-scheduler
+    # Two is deliberate, not a compromise. The engine locks each execution with
+    # SKIP LOCKED and the reaper's writes are compare-and-swaps, so replicas do not
+    # conflict — while a single replica would mean a node failure stops scheduling
+    # for every workflow in the system.
+    count: 2
+
+patches:
+  - path: patch-config.yaml
+  - path: patch-hpa.yaml
+  - path: patch-resources.yaml
+  - path: patch-irsa.yaml
+  - path: patch-secretprovider.yaml

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+    # Enforce the restricted Pod Security Standard at the namespace level, so a
+    # workload that drifts from the hardened securityContext below is rejected by
+    # the API server rather than quietly admitted.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

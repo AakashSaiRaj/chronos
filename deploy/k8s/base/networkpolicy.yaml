@@ -1,0 +1,134 @@
+# Network policy: default-deny, then allow only the paths Chronos actually uses.
+#
+# Security groups guard the node; this guards the pod, which is the unit that
+# matters. Without it, a compromised worker could reach the database directly and
+# bypass every guarantee the control plane enforces — claim tokens, state machine
+# transitions, idempotency.
+#
+# Requires a CNI that enforces NetworkPolicy. The EKS VPC CNI does so only with
+# network policy support enabled; see deploy/k8s/README.md.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+spec:
+  podSelector: {} # every pod in the namespace
+  policyTypes: [Ingress, Egress]
+---
+# DNS is needed by everything, and is the one egress rule that cannot be omitted.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: chronos
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# The API tier accepts traffic from workers and from the ingress controller.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-ingress
+  namespace: chronos
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: chronos
+      app.kubernetes.io/component: api
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: chronos
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Load balancer targets arrive from outside the pod network.
+    - from:
+        - ipBlock:
+            cidr: 10.42.0.0/16
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Workers may talk to the API and to AWS endpoints. Notably absent: PostgreSQL.
+# A worker has no database credentials and no reason to reach port 5432, so the
+# policy says so explicitly rather than relying on the absence of a password.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-egress
+  namespace: chronos
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: chronos
+      app.kubernetes.io/component: worker
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: chronos
+              app.kubernetes.io/component: api
+      ports:
+        - protocol: TCP
+          port: 8080
+    # HTTPS out, for activities that call external services.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # Not the VPC. An activity reaching internal infrastructure directly
+              # would sidestep the control plane entirely.
+              - 10.42.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# Control-plane pods reach PostgreSQL and the AWS endpoints for secrets.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: server-egress
+  namespace: chronos
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [api, scheduler, migrate]
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.42.0.0/16
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Secrets Manager and STS, via the interface VPC endpoints.
+    - to:
+        - ipBlock:
+            cidr: 10.42.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

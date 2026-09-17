@@ -191,3 +191,36 @@ stack-down: ## Stop the full stack
 .PHONY: stack-logs
 stack-logs: ## Tail logs from the containerized stack
 	$(COMPOSE) --profile app logs -f
+
+# ---------------------------------------------------------------------------
+# Deployment (Terraform + Kubernetes)
+# ---------------------------------------------------------------------------
+
+TF_DIR ?= deploy/terraform
+ENV    ?= dev
+
+.PHONY: tf-validate
+tf-validate: ## Format-check and validate Terraform (no credentials needed)
+	cd $(TF_DIR) && terraform fmt -check -recursive -diff
+	cd $(TF_DIR) && terraform init -backend=false -input=false >/dev/null
+	cd $(TF_DIR) && terraform validate
+
+.PHONY: tf-fmt
+tf-fmt: ## Format Terraform files
+	cd $(TF_DIR) && terraform fmt -recursive
+
+.PHONY: tf-plan
+tf-plan: ## Plan infrastructure for ENV (needs AWS credentials)
+	cd $(TF_DIR) && terraform init -input=false -backend-config=envs/$(ENV).backend.hcl
+	cd $(TF_DIR) && terraform plan -input=false -var-file=envs/$(ENV).tfvars
+
+.PHONY: k8s-render
+k8s-render: ## Render the Kustomize overlay for ENV to stdout
+	@kubectl kustomize deploy/k8s/overlays/$(ENV)
+
+.PHONY: k8s-validate
+k8s-validate: ## Render both overlays and assert probes, limits, and no secrets
+	@./scripts/validate-deploy.sh
+
+.PHONY: deploy-validate
+deploy-validate: tf-validate k8s-validate ## Validate all deployment configuration

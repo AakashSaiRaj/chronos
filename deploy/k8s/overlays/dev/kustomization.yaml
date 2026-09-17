@@ -1,0 +1,38 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Development overlay: fewer replicas, a tighter HPA ceiling, debug logging.
+#
+# The placeholder ARNs and secret name are what the deploy pipeline substitutes
+# from Terraform outputs (see .github/workflows/cd.yml). They are left visibly
+# fake so a manifest applied without substitution fails loudly at the IRSA step
+# rather than silently running without credentials.
+
+namespace: chronos
+
+resources:
+  - ../../base
+
+nameSuffix: ""
+
+commonAnnotations:
+  chronos.io/environment: dev
+
+images:
+  - name: chronos
+    newName: 000000000000.dkr.ecr.us-east-1.amazonaws.com/chronos-dev
+    newTag: dev
+
+replicas:
+  - name: chronos-api
+    count: 1
+  - name: chronos-scheduler
+    # One scheduler is acceptable in dev: a gap in scheduling costs nothing here.
+    # Production runs two so a node failure does not stop every workflow.
+    count: 1
+
+patches:
+  - path: patch-config.yaml
+  - path: patch-hpa.yaml
+  - path: patch-irsa.yaml
+  - path: patch-secretprovider.yaml

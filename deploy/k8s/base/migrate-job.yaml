@@ -1,0 +1,98 @@
+# Schema migrations, owned by a Job rather than by the application replicas.
+#
+# store.Migrate already serializes concurrent runners with a PostgreSQL advisory
+# lock and applies each migration in one transaction with its ledger row, so
+# letting every replica migrate on startup would be *safe*. It would not be
+# *operable*: a bad migration would crash-loop the entire fleet, and the failure
+# would surface as pods restarting rather than as a deploy that stopped.
+#
+# As a Job, a failed migration fails the rollout at a named step, and the previous
+# version keeps serving.
+#
+# The generateName-style suffix comes from the Kustomize overlay, which stamps the
+# image tag into the Job name. That matters because a Job's spec is immutable: the
+# same name cannot be re-applied with a new image.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: chronos-migrate
+  namespace: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+    app.kubernetes.io/component: migrate
+spec:
+  # A migration that cannot succeed should stop the deploy, not retry forever.
+  backoffLimit: 2
+  # Bound the whole attempt, so a migration blocked on a lock does not hold the
+  # rollout open indefinitely.
+  activeDeadlineSeconds: 900
+  # Keep the pod around briefly after success so its logs are retrievable.
+  ttlSecondsAfterFinished: 600
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chronos
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      serviceAccountName: chronos-server
+      automountServiceAccountToken: true
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: migrate
+          image: chronos:dev
+          imagePullPolicy: IfNotPresent
+          # -migrate applies pending migrations and exits.
+          command: ["/usr/local/bin/chronos-server", "-migrate"]
+
+          envFrom:
+            - configMapRef:
+                name: chronos-config
+          env:
+            - name: CHRONOS_DATABASE_URL_FILE
+              value: /etc/chronos/secrets/database-url
+            # Only two connections are needed, and taking twenty from a pool the
+            # running fleet is also using would be rude.
+            - name: CHRONOS_DB_MAX_CONNS
+              value: "2"
+            - name: CHRONOS_DB_MIN_CONNS
+              value: "1"
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: database-secret
+              mountPath: /etc/chronos/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: database-secret
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: chronos-database
+        - name: tmp
+          emptyDir: {}

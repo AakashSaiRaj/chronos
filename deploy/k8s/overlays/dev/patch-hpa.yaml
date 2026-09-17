@@ -1,0 +1,21 @@
+# A tight ceiling in dev. The point of the HPA here is to verify it works, not to
+# absorb real load, and a runaway scale-up on a two-node group would just fill the
+# cluster with unschedulable pods.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: chronos-worker
+  namespace: chronos
+spec:
+  minReplicas: 1
+  maxReplicas: 4
+  behavior:
+    scaleDown:
+      # Much shorter than production's five minutes: in dev, watching it scale back
+      # down within a test run is more useful than protecting in-flight work.
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 30
+      selectPolicy: Min

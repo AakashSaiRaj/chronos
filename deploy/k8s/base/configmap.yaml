@@ -1,0 +1,72 @@
+# Non-secret configuration shared by all three workloads.
+#
+# Deliberately excludes CHRONOS_DATABASE_URL: that arrives from Secrets Manager
+# via the CSI mount, so it never appears in a ConfigMap, a manifest, or `kubectl
+# describe` output.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chronos-config
+  namespace: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+data:
+  CHRONOS_LOG_LEVEL: "info"
+  # JSON in a cluster: logs are read by a collector, not a human tailing a file.
+  CHRONOS_LOG_FORMAT: "json"
+
+  CHRONOS_HTTP_ADDR: ":8080"
+
+  # Migrations are owned by a Job, not by every replica racing on startup. The
+  # advisory lock in store.Migrate makes concurrent runners safe, but a dedicated
+  # Job also means a bad migration fails the rollout instead of crash-looping the
+  # whole fleet.
+  CHRONOS_MIGRATE_ON_START: "false"
+
+  # Connection pool sizing. This is per replica, so the ceiling that matters is
+  # (server replicas + scheduler replicas) x max conns, which must stay under the
+  # database's max_connections with room for the HPA to scale.
+  CHRONOS_DB_MAX_CONNS: "20"
+  CHRONOS_DB_MIN_CONNS: "2"
+
+  CHRONOS_ENGINE_POLL_INTERVAL: "250ms"
+  CHRONOS_ENGINE_BATCH_SIZE: "200"
+
+  CHRONOS_REAPER_INTERVAL: "1s"
+  # Must be several worker heartbeat intervals, so one dropped request cannot
+  # evict a healthy worker. Worker heartbeat below is 10s.
+  CHRONOS_WORKER_TIMEOUT: "45s"
+
+  # Long enough that a rolling deploy drains in-flight tasks rather than
+  # abandoning them to lease expiry.
+  CHRONOS_SHUTDOWN_TIMEOUT: "25s"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chronos-worker-config
+  namespace: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+    app.kubernetes.io/component: worker
+data:
+  # Workers reach the control plane only over HTTP, through the cluster Service.
+  CHRONOS_SERVER_URL: "http://chronos-api.chronos.svc.cluster.local:8080"
+  CHRONOS_TASK_QUEUE: "default"
+
+  # Concurrency is per pod; the HPA scales pods. Four keeps each pod's footprint
+  # predictable enough for the CPU-based HPA target to mean something.
+  CHRONOS_WORKER_CONCURRENCY: "4"
+
+  CHRONOS_WORKER_POLL_INTERVAL: "250ms"
+  CHRONOS_WORKER_LEASE_DURATION: "30s"
+  # Must be shorter than the lease; config validation enforces it at startup.
+  CHRONOS_WORKER_HEARTBEAT_INTERVAL: "10s"
+  CHRONOS_WORKER_REQUEST_TIMEOUT: "15s"
+
+  # A worker has no other inbound surface, so this is what the probes talk to.
+  CHRONOS_WORKER_HEALTH_ADDR: ":8090"
+
+  CHRONOS_LOG_LEVEL: "info"
+  CHRONOS_LOG_FORMAT: "json"
+  CHRONOS_SHUTDOWN_TIMEOUT: "25s"

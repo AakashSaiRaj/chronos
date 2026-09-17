@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Base manifests. Environment-specific values (image, IAM role ARNs, secret name,
+# replica counts, HPA bounds) live in the overlays, so nothing here needs editing
+# to deploy to a second environment.
+
+namespace: chronos
+
+resources:
+  - namespace.yaml
+  - serviceaccounts.yaml
+  - secretproviderclass.yaml
+  - configmap.yaml
+  - migrate-job.yaml
+  - api.yaml
+  - scheduler.yaml
+  - worker.yaml
+  - networkpolicy.yaml
+
+commonLabels:
+  app.kubernetes.io/name: chronos
+  app.kubernetes.io/part-of: chronos
+
+images:
+  - name: chronos
+    newName: chronos
+    newTag: dev

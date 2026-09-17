@@ -1,0 +1,199 @@
+name: Terraform
+
+# Plans infrastructure changes on pull requests and posts the plan for review.
+# Applies only from mainline, and only when a human dispatches it.
+#
+# The split matters: a plan is read-only and safe to run automatically, an apply
+# changes production and should not happen because someone merged a pull request
+# whose infrastructure diff nobody read.
+
+on:
+  pull_request:
+    paths:
+      - "deploy/terraform/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment
+        required: true
+        default: dev
+        type: choice
+        options: [dev, prod]
+      action:
+        description: What to run
+        required: true
+        default: plan
+        type: choice
+        options: [plan, apply]
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write # to post the plan as a comment
+
+concurrency:
+  # Terraform state is a single writer resource; two applies at once corrupt it.
+  group: terraform-${{ inputs.environment || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+
+      - name: Format check
+        working-directory: deploy/terraform
+        run: terraform fmt -check -recursive -diff
+
+      - name: Validate
+        working-directory: deploy/terraform
+        # No backend and no credentials needed, so this runs on fork pull requests.
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+  plan:
+    name: Plan ${{ inputs.environment || 'dev' }}
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # A plan needs real credentials to read state, so it cannot run for a fork.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+
+    environment:
+      name: ${{ inputs.environment || 'dev' }}
+
+    env:
+      ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+
+      - name: Assume role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: chronos-tf-${{ github.run_id }}
+
+      - name: Plan
+        id: plan
+        working-directory: deploy/terraform
+        run: |
+          set -euo pipefail
+          terraform init -input=false \
+            -backend-config="envs/${ENVIRONMENT}.backend.hcl"
+
+          # -detailed-exitcode distinguishes "no changes" (0) from "changes
+          # pending" (2) from "error" (1), so the summary can say which.
+          set +e
+          terraform plan -input=false -lock-timeout=5m \
+            -var-file="envs/${ENVIRONMENT}.tfvars" \
+            -out=tfplan -detailed-exitcode
+          code=$?
+          set -e
+
+          case "${code}" in
+            0) echo "changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "changes=true"  >> "$GITHUB_OUTPUT" ;;
+            *) exit "${code}" ;;
+          esac
+
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Summarise plan
+        working-directory: deploy/terraform
+        run: |
+          {
+            echo "### Terraform plan — \`${ENVIRONMENT}\`"
+            echo
+            echo "Pending changes: \`${{ steps.plan.outputs.changes }}\`"
+            echo
+            echo '<details><summary>Plan output</summary>'
+            echo
+            echo '```terraform'
+            # Truncated: a full EKS plan is far longer than a comment can hold,
+            # and the artifact below has the whole thing.
+            head -c 60000 plan.txt
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}
+          # The binary plan, so an apply uses exactly what was reviewed rather
+          # than re-planning against state that may have moved.
+          path: |
+            deploy/terraform/tfplan
+            deploy/terraform/plan.txt
+          retention-days: 14
+
+  apply:
+    name: Apply ${{ inputs.environment }}
+    needs: plan
+    # Manual dispatch only, and only with action=apply explicitly selected.
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    environment:
+      # A protected environment with required reviewers is the approval gate.
+      name: ${{ inputs.environment }}
+
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+
+      - name: Assume role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: chronos-tf-apply-${{ github.run_id }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}
+          path: deploy/terraform
+
+      - name: Apply
+        working-directory: deploy/terraform
+        # Applies the reviewed plan file, not a fresh plan. If state has drifted
+        # since, Terraform refuses rather than applying something nobody saw.
+        run: |
+          terraform init -input=false \
+            -backend-config="envs/${ENVIRONMENT}.backend.hcl"
+          terraform apply -input=false -lock-timeout=5m tfplan
+
+      - name: Outputs
+        working-directory: deploy/terraform
+        run: |
+          # Only non-sensitive outputs. The database DSN lives in Secrets Manager
+          # and only its ARN is ever exported.
+          terraform output -json \
+            | jq 'map_values(select(.sensitive == false) | .value)'

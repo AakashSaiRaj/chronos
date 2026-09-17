@@ -1,0 +1,157 @@
+# Scheduler tier: the engine and the reaper. No inbound traffic.
+#
+# Two replicas, not one. This is safe rather than merely tolerable: the engine
+# locks each execution with SELECT ... FOR UPDATE SKIP LOCKED, so a second replica
+# either works on a different execution or moves on, and the reaper's writes are
+# guarded compare-and-swaps. Running two means a node failure does not stop
+# scheduling for the whole system, which is what a single replica would do.
+#
+# It is a Deployment rather than a StatefulSet or a leader-elected singleton
+# precisely because there is no state to own and no leader to elect.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chronos-scheduler
+  namespace: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+    app.kubernetes.io/component: scheduler
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chronos
+      app.kubernetes.io/component: scheduler
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # A sweep interrupted mid-transaction simply rolls back and is re-derived
+      # from persisted state by whoever runs next, so replacing one replica at a
+      # time costs nothing.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chronos
+        app.kubernetes.io/component: scheduler
+    spec:
+      serviceAccountName: chronos-server
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: chronos
+              app.kubernetes.io/component: scheduler
+
+      containers:
+        - name: scheduler
+          image: chronos:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/chronos-server"]
+
+          ports:
+            # The HTTP server still runs, but only so the probes have something to
+            # talk to. No Service points at it, so nothing else can reach it.
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: chronos-config
+          env:
+            - name: CHRONOS_ENGINE_ENABLED
+              value: "true"
+            - name: CHRONOS_REAPER_ENABLED
+              value: "true"
+            - name: CHRONOS_DATABASE_URL_FILE
+              value: /etc/chronos/secrets/database-url
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 20
+
+          resources:
+            requests:
+              # The sweep is bounded by database round trips, not local CPU, so a
+              # scheduler is cheaper than it looks.
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: database-secret
+              mountPath: /etc/chronos/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: database-secret
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: chronos-database
+        - name: tmp
+          emptyDir: {}
+---
+# Losing all schedulers stops every workflow in the system from progressing, so a
+# node drain must leave one running.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: chronos-scheduler
+  namespace: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+    app.kubernetes.io/component: scheduler
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chronos
+      app.kubernetes.io/component: scheduler

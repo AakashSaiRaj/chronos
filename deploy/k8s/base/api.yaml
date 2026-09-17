@@ -1,0 +1,197 @@
+# API tier: serves the REST control plane and nothing else.
+#
+# The engine and reaper are switched off here (CHRONOS_ENGINE_ENABLED=false,
+# CHRONOS_REAPER_ENABLED=false) so this tier scales purely with request volume.
+# Scheduling load and request load are unrelated, and coupling them would mean an
+# API traffic spike spawning more schedulers that have no extra work to do.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chronos-api
+  namespace: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chronos
+      app.kubernetes.io/component: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never drop below the current replica count during a rollout: workers poll
+      # this tier continuously, and losing capacity mid-deploy shows up as failed
+      # polls across the whole fleet.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chronos
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: chronos-server
+      # IRSA needs the projected token, so it is mounted here even though the
+      # ServiceAccount defaults it off for everything else.
+      automountServiceAccountToken: true
+      # Enough time for in-flight requests to finish; the process stops accepting
+      # new ones immediately on SIGTERM.
+      terminationGracePeriodSeconds: 30
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Spread replicas across AZs. Without this the scheduler may co-locate both
+      # replicas on one node, and a single node failure takes the tier down.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: chronos
+              app.kubernetes.io/component: api
+
+      containers:
+        - name: api
+          image: chronos:dev # replaced by the overlay's image transformer
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/chronos-server"]
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: chronos-config
+          env:
+            # API-only replica: scheduling and failure detection belong to the
+            # scheduler tier.
+            - name: CHRONOS_ENGINE_ENABLED
+              value: "false"
+            - name: CHRONOS_REAPER_ENABLED
+              value: "false"
+            # The DSN is read from the CSI-mounted file rather than passed as a
+            # value, so it never appears in the pod spec or in `kubectl describe`.
+            - name: CHRONOS_DATABASE_URL_FILE
+              value: /etc/chronos/secrets/database-url
+            - name: CHRONOS_VERSION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['app.kubernetes.io/version']
+
+          # Liveness must not depend on the database: restarting a pod because
+          # PostgreSQL is briefly unreachable adds churn to an already degraded
+          # system and fixes nothing. Readiness does check, and fails fast.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            # Tolerant of a blip, quick to react to a real outage.
+            failureThreshold: 3
+
+          # Gates the rollout: a pod that cannot reach the database on start never
+          # becomes ready, so the deployment stalls instead of replacing healthy
+          # pods with broken ones.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 20
+
+          resources:
+            requests:
+              # Requests are what the scheduler and the HPA reason about, so they
+              # reflect steady-state usage rather than a guess at the peak.
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # No CPU limit on purpose: CFS throttling at the limit would add
+              # latency to request handling for no benefit, and the request already
+              # guarantees a floor. Memory is limited because a leak must be
+              # contained rather than allowed to evict neighbours.
+              memory: 512Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: database-secret
+              mountPath: /etc/chronos/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: database-secret
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: chronos-database
+        # readOnlyRootFilesystem is on, so anything needing scratch space gets an
+        # explicit emptyDir.
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chronos-api
+  namespace: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: chronos
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+# Workers poll this tier constantly, so a voluntary disruption (node drain,
+# cluster upgrade) must not be allowed to take all of it at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: chronos-api
+  namespace: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+    app.kubernetes.io/component: api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chronos
+      app.kubernetes.io/component: api

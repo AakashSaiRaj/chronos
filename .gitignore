@@ -25,3 +25,38 @@ aim.txt
 
 # Postgres data volume (podman bind mounts, if used)
 /.data/
+
+# ---------------------------------------------------------------------------
+# Terraform
+# ---------------------------------------------------------------------------
+
+# Provider download cache. Platform-specific binaries, hundreds of megabytes,
+# and reconstructible with `terraform init` — the Terraform equivalent of
+# node_modules.
+**/.terraform/
+
+# State belongs in the S3 backend, not in Git. A committed state file leaks
+# every attribute of every resource, including generated passwords.
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+
+# Plan files are binary and contain resolved values, so a committed plan can leak
+# a credential that the configuration itself never mentions.
+tfplan
+*.tfplan
+plan.txt
+
+crash.log
+crash.*.log
+
+# Local developer overrides must not become everyone's configuration.
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# NOT ignored, deliberately: .terraform.lock.hcl. It pins provider versions and
+# their checksums, which is what makes a build reproducible across machines and
+# CI. Ignoring it would let CI silently resolve a different provider version than
+# the one that was reviewed.

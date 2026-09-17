@@ -1,0 +1,181 @@
+name: CI
+
+# Runs on every push and pull request. Nothing here touches AWS or needs
+# credentials, so it is safe to run on pull requests from forks.
+
+on:
+  push:
+    branches: [mainline]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel superseded runs on the same ref: the newest commit is the only one
+  # whose result anyone will act on.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Dependencies are vendored, so no module proxy is consulted and the build is
+  # reproducible from a clean clone with no network access.
+  GOFLAGS: -mod=vendor
+
+jobs:
+  verify:
+    name: Build, vet and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      # Integration tests run against real PostgreSQL, because the engine's
+      # correctness rests on SKIP LOCKED, partial unique indexes, and row-level
+      # locking — none of which a fake would exercise.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: chronos
+          POSTGRES_PASSWORD: chronos
+          POSTGRES_DB: chronos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U chronos -d chronos"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Read from go.mod rather than pinned here, so the toolchain cannot
+          # drift away from what the module declares.
+          go-version-file: go.mod
+          cache: false # vendored deps make the module cache pointless
+
+      - name: Verify vendor directory is current
+        # Catches the failure mode where go.mod and vendor/ disagree, which would
+        # make the container build produce something different from CI.
+        run: |
+          go mod verify
+          go mod vendor
+          git diff --exit-code --stat vendor/ go.mod go.sum \
+            || { echo "::error::vendor/ is out of date; run 'make tidy'"; exit 1; }
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [ -n "${unformatted}" ]; then
+            echo "::error::gofmt needed for:"; echo "${unformatted}"; exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        env:
+          CHRONOS_TEST_DATABASE_URL: postgres://chronos:chronos@127.0.0.1:5432/chronos?sslmode=disable
+        # -race because the engine, reaper, and worker are all concurrent; a data
+        # race here would be a correctness bug, not a style issue.
+        run: go test ./... -count=1 -race -timeout 10m
+
+      - name: Coverage
+        env:
+          CHRONOS_TEST_DATABASE_URL: postgres://chronos:chronos@127.0.0.1:5432/chronos?sslmode=disable
+        run: |
+          go test ./... -count=1 -coverprofile=coverage.out -coverpkg=./internal/... >/dev/null
+          go tool cover -func=coverage.out | tail -1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  image:
+    name: Build container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        # Proves the image builds on every change, without pushing it. The build
+        # runs with no network access, which the vendored dependencies make
+        # possible and which guarantees nothing is pulled in at build time.
+        run: |
+          docker build \
+            --network=none \
+            --build-arg VERSION="${GITHUB_SHA::12}" \
+            -f Containerfile \
+            -t "chronos:${GITHUB_SHA::12}" .
+
+      - name: Smoke test the binaries
+        run: |
+          docker run --rm "chronos:${GITHUB_SHA::12}" -version
+          docker run --rm --entrypoint /usr/local/bin/chronos-worker \
+            "chronos:${GITHUB_SHA::12}" -version
+
+  manifests:
+    name: Validate deployment manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+
+      - name: Terraform format and validate
+        working-directory: deploy/terraform
+        run: |
+          terraform fmt -check -recursive
+          # -backend=false: validation needs no state and no credentials.
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: Render Kustomize overlays
+        run: |
+          for overlay in deploy/k8s/overlays/*/; do
+            name="$(basename "${overlay}")"
+            echo "--- ${name} ---"
+            kubectl kustomize "${overlay}" > "/tmp/${name}.yaml"
+            echo "$(grep -c '^kind:' "/tmp/${name}.yaml") objects"
+          done
+
+      - name: Assert no credentials in rendered manifests
+        # A rendered manifest containing a DSN would mean the Secrets Manager path
+        # had been bypassed. Cheap to check, and the failure it catches is severe.
+        run: |
+          if grep -rInE 'postgres://[a-z]+:[^$@]+@' /tmp/*.yaml; then
+            echo "::error::a rendered manifest contains a database credential"
+            exit 1
+          fi
+
+      - name: Assert probes and limits are present
+        # Guards the requirements that are easy to drop silently in a refactor and
+        # only noticed during an incident.
+        run: |
+          fail=0
+          for overlay in dev prod; do
+            f="/tmp/${overlay}.yaml"
+            for required in livenessProbe readinessProbe 'runAsNonRoot: true' \
+                            'readOnlyRootFilesystem: true' 'resources:'; do
+              if ! grep -q "${required}" "${f}"; then
+                echo "::error::${overlay} is missing ${required}"; fail=1
+              fi
+            done
+          done
+          exit "${fail}"

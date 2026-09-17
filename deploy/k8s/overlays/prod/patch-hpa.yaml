@@ -1,0 +1,57 @@
+# Production autoscaling for the worker pool.
+#
+# Asymmetric on purpose. Scaling up costs an idle poll from a worker that finds
+# nothing to do. Scaling down costs abandoned in-flight work: a worker removed
+# mid-activity has its task reclaimed by lease expiry and redone, which for any
+# activity that is not perfectly idempotent means a duplicated side effect. So up
+# is aggressive and down is patient.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: chronos-worker
+  namespace: chronos
+spec:
+  # Never below three: two AZs' worth of redundancy plus one, so a zone loss does
+  # not halve throughput.
+  minReplicas: 3
+  # Bounded by what the database can serve. Workers hold no database connections
+  # themselves, but every poll and report is a request the API turns into queries,
+  # so this ceiling and db_max_connections are the same conversation.
+  maxReplicas: 40
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 8
+          periodSeconds: 30
+      selectPolicy: Max
+
+    scaleDown:
+      # Ten minutes of sustained low utilisation before shrinking. Combined with
+      # the 60s terminationGracePeriod, a removed worker gets to finish and report
+      # rather than having its task reclaimed.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 120
+      selectPolicy: Min

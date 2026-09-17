@@ -5,10 +5,14 @@ tasks, start an execution, and a pool of workers executes the tasks in dependenc
 order. Every piece of state lives in PostgreSQL, so an execution survives the
 process that started it.
 
-**Phases 1 and 2 are complete**: a locally runnable engine with workers executing
-persisted workflows, made fault-tolerant with retries, lease reclamation, worker
-failure detection, and dead-letter handling. Phases 3–4 add cloud-native
-deployment and observability — see [What's next](#whats-next).
+**Phases 1–3 are complete**: a fault-tolerant workflow engine, plus the Terraform
+and Kubernetes configuration to run it on EKS with autoscaling workers. Phase 4
+adds observability — see [What's next](#whats-next).
+
+One caveat stated up front: the Phase 3 infrastructure has been validated but never
+applied. No AWS account was used, so `terraform apply` has not run and nothing has
+been exercised against a real cluster. See
+[what has and has not been verified](deploy/README.md#what-has-and-has-not-been-verified).
 
 ```
 Workflow "order_pipeline"
@@ -49,6 +53,9 @@ make test-integration  # everything, against the podman PostgreSQL
 make stack-up          # postgres + server + 2 workers, all in containers
 make psql              # inspect the database directly
 make dlq               # show the dead letter queue
+
+make deploy-validate   # validate Terraform + Kubernetes config (no AWS needed)
+make k8s-render ENV=prod   # see exactly what would be applied
 ```
 
 ---
@@ -664,7 +671,7 @@ Failure scenarios (`internal/engine/failure_integration_test.go`):
 ## Project layout
 
 ```
-cmd/chronos-server/        API + engine
+cmd/chronos-server/        API + engine + reaper (and -migrate mode)
 cmd/chronos-worker/        task executor
 internal/domain/           entities, state machines, DAG validation (no I/O)
 internal/store/            PostgreSQL: repositories, queue, migrations
@@ -674,8 +681,64 @@ internal/client/           Go SDK
 internal/worker/           poll loop, activity registry, example activities
 internal/config/           env configuration
 internal/testsupport/      integration test harness + failure injection helpers
-scripts/                   demo.sh, recovery-demo.sh, failure-demo.sh
+scripts/                   demo.sh, recovery-demo.sh, failure-demo.sh,
+                           validate-deploy.sh
+deploy/terraform/          VPC, EKS, RDS, IAM/IRSA, ECR, optional Redis + SQS
+deploy/k8s/                Kustomize base + dev/prod overlays
+.github/workflows/         ci.yml, cd.yml, terraform.yml
 ```
+
+See [deploy/README.md](deploy/README.md) for the deployment architecture, bootstrap
+steps, and the cluster add-ons Terraform does not manage.
+
+---
+
+## Deployment
+
+Terraform provisions AWS; Kustomize deploys onto EKS; GitHub Actions runs both.
+Full detail in [deploy/README.md](deploy/README.md); the decisions worth stating
+here:
+
+**Three tiers, scaled independently.** The API runs with the engine and reaper
+switched off, the scheduler runs with them on and no Service pointing at it, and
+only the workers autoscale. API load follows request volume while scheduling load
+follows the number of live executions — coupling them would mean a traffic spike
+spawning schedulers with no extra work to do.
+
+**Two scheduler replicas, not one, and no leader election.** The engine locks each
+execution with `SKIP LOCKED` and the reaper's writes are guarded compare-and-swaps,
+so replicas do not conflict. A single replica would mean one node failure stops
+scheduling for every workflow in the system. This is the deployment cashing in the
+horizontal scalability the stateless engine was designed for.
+
+**Only workers autoscale, because only workers are safe to kill.** They hold no
+state and reach the control plane only over HTTP, so losing one means its lease
+lapses and the reaper reassigns its task. The HPA is asymmetric for the same
+reason: scale-up is aggressive (a spare worker costs one idle poll), scale-down
+waits ten minutes and removes two pods at a time (a worker removed mid-activity has
+its task redone). Note honestly that CPU is a *proxy* for queue depth and a poor one
+for I/O-bound activities; the right signal needs the custom metrics Phase 4 adds.
+
+**Migrations are a Job, not a startup step.** `store.Migrate` is already safe to run
+concurrently — advisory lock, one transaction per migration — so every replica
+migrating on boot would work. It would not be *operable*: a bad migration would
+crash-loop the fleet instead of failing the deploy at a named step.
+
+**No Kubernetes Secret exists.** The DSN is mounted from Secrets Manager by the CSI
+driver using each pod's own IRSA identity, and read via `CHRONOS_DATABASE_URL_FILE`.
+So there is nothing to `kubectl get secret`, the value never enters an environment
+variable (absent from `describe`, from crash dumps, from `/proc/<pid>/environ`), and
+no controller holds standing read access to every secret in the account.
+
+**The worker IAM role grants nothing.** Deliberately. Workers need no AWS access, so
+a compromised worker pod cannot read the credential the API pods can. The role
+exists for audit identity and so that granting it something later is a reviewable
+change.
+
+**Redis and SQS are provisioned but disabled.** Chronos's queue is the `tasks` table
+by design and nothing reads from a cache, so enabling them would buy a bill and two
+more things that can be down. The modules are written and flag-gated for the day
+something uses them.
 
 ---
 
@@ -718,6 +781,27 @@ addition.
 | Scheduler recovery | stateless engine and reaper; delays persisted as timestamps |
 | Automated failure tests | `failure_integration_test.go`, `make failure-demo` |
 
+### Phase 3
+
+| Requirement | Where |
+|---|---|
+| Terraform-provisioned AWS | `deploy/terraform/` — VPC, EKS, RDS, IAM, ECR |
+| EKS deployment | `deploy/k8s/` Kustomize base + dev/prod overlays |
+| API service | `chronos-api` Deployment + Service (+ prod Ingress) |
+| Engine/scheduler | `chronos-scheduler` Deployment, 2 replicas, no Service |
+| Worker pool | `chronos-worker` Deployment, HPA-managed |
+| PostgreSQL | RDS Multi-AZ with queue-aware parameter tuning |
+| Queue infrastructure | the `tasks` table; SQS module flag-gated off |
+| Redis | ElastiCache module flag-gated off |
+| Kubernetes HPA | `chronos-worker`, CPU + memory, asymmetric behaviour |
+| Readiness/liveness probes | all three workloads, plus startup probes |
+| Resource requests/limits | requests everywhere; memory limits, no CPU limits |
+| Rolling deployments | `maxUnavailable: 0` on every tier, PDBs, rollback in CD |
+| Secrets management | Secrets Manager + CSI driver, no Kubernetes Secret |
+| IAM least privilege | three IRSA roles, resource-scoped, worker role empty |
+| CI/CD via GitHub Actions | `ci.yml`, `cd.yml`, `terraform.yml` with OIDC |
+| Reproducible via Terraform | `make tf-plan ENV=dev` from a clean clone |
+
 ### Known boundaries
 
 Stated plainly, because they are deliberate scope decisions rather than oversights:
@@ -738,15 +822,25 @@ Stated plainly, because they are deliberate scope decisions rather than oversigh
 - **Single queue backend.** PostgreSQL only, by the reasoning above.
 - **No metrics or tracing yet.** Failure detection is observable through history
   events and structured logs; Prometheus and OpenTelemetry are Phase 4.
+- **The infrastructure has never been applied.** Terraform validates and the
+  manifests render, but no AWS account was used. `terraform validate` checks syntax
+  and provider schemas; it does not catch an insufficient IAM policy, an IRSA trust
+  policy that does not match, or an add-on version conflict. Treat the first apply
+  as an exercise expected to surface problems.
+- **The worker HPA scales on CPU, which is a proxy for queue depth.** Fine for
+  compute-bound activities, poor for I/O-bound ones: a worker blocked on a slow
+  downstream uses no CPU while the queue backs up behind it. Scaling on claimable
+  task count needs the metrics Phase 4 adds.
+- **No cluster autoscaler.** The node group has min/max bounds but nothing moves
+  `desired_size`, so the worker HPA can only scale within existing node capacity.
 
 ---
 
 ## What's next
 
-- **Phase 3** — Terraform-provisioned AWS, EKS deployment, HPA, readiness and
-  liveness probes, resource limits, rolling deploys, secrets, IAM least privilege,
-  CI/CD through GitHub Actions
 - **Phase 4** — OpenTelemetry tracing, Prometheus metrics (queue depth, worker
   utilization, retry and failure rates), Grafana dashboards, alerting, and load
   testing with documented throughput, p50/p95/p99 latency, and measured recovery
-  time after worker failure
+  time after worker failure. The metrics are also what would replace the HPA's
+  CPU proxy with a real queue-depth signal, and what should decide the RDS
+  instance class rather than the current guess.

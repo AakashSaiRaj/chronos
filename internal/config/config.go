@@ -82,6 +82,11 @@ type Worker struct {
 	// declares no timeout.
 	TaskTimeout time.Duration
 
+	// HealthAddr is where the worker serves liveness and readiness probes. A
+	// worker has no other inbound surface, so without this Kubernetes has nothing
+	// to ask. Empty disables it.
+	HealthAddr string
+
 	RequestTimeout  time.Duration
 	ShutdownTimeout time.Duration
 	Logging         Logging
@@ -97,14 +102,18 @@ func LoadServer() (Server, error) {
 	}
 
 	cfg := Server{
-		DatabaseURL: envString("CHRONOS_DATABASE_URL", DefaultDatabaseURL),
-		HTTPAddr:    envString("CHRONOS_HTTP_ADDR", ":8088"),
-		Version:     envString("CHRONOS_VERSION", "dev"),
+		HTTPAddr: envString("CHRONOS_HTTP_ADDR", ":8088"),
+		Version:  envString("CHRONOS_VERSION", "dev"),
 	}
+
+	// The DSN may arrive as a file, which is how a secret manager delivers it.
+	databaseURL, err := envSecret("CHRONOS_DATABASE_URL", DefaultDatabaseURL)
+	collect(err)
+	cfg.DatabaseURL = databaseURL
 
 	maxConns, err := envInt("CHRONOS_DB_MAX_CONNS", 20, 1, 1000)
 	collect(err)
-	cfg.DBMaxConns = int32(maxConns)
+	cfg.DBMaxConns = int32(maxConns) //nolint:gosec // bounded above by envInt
 
 	minConns, err := envInt("CHRONOS_DB_MIN_CONNS", 2, 0, 1000)
 	collect(err)
@@ -171,9 +180,10 @@ func LoadWorker() (Worker, error) {
 	}
 
 	cfg := Worker{
-		ServerURL: strings.TrimRight(envString("CHRONOS_SERVER_URL", DefaultServerURL), "/"),
-		Name:      envString("CHRONOS_WORKER_NAME", defaultWorkerName()),
-		TaskQueue: envString("CHRONOS_TASK_QUEUE", "default"),
+		ServerURL:  strings.TrimRight(envString("CHRONOS_SERVER_URL", DefaultServerURL), "/"),
+		Name:       envString("CHRONOS_WORKER_NAME", defaultWorkerName()),
+		TaskQueue:  envString("CHRONOS_TASK_QUEUE", "default"),
+		HealthAddr: envString("CHRONOS_WORKER_HEALTH_ADDR", ":8090"),
 	}
 
 	var err error
@@ -253,6 +263,37 @@ func envString(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envSecret reads a value that may be supplied indirectly via <KEY>_FILE.
+//
+// Secret managers mount credentials as files, not environment variables — for
+// good reason: an env var is visible in `kubectl describe`, in a crash dump, and
+// to anything that can read /proc/<pid>/environ, and it cannot be rotated without
+// restarting the process. Supporting the file form means the DSN never has to
+// pass through the environment at all.
+//
+// The direct value still wins when set, so local development and compose stay
+// unchanged.
+func envSecret(key, def string) (string, error) {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v, nil
+	}
+
+	path := strings.TrimSpace(os.Getenv(key + "_FILE"))
+	if path == "" {
+		return def, nil
+	}
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("%s_FILE: read %s: %w", key, path, err)
+	}
+	value := strings.TrimSpace(string(body))
+	if value == "" {
+		return "", fmt.Errorf("%s_FILE: %s is empty", key, path)
+	}
+	return value, nil
 }
 
 func envInt(key string, def, min, max int) (int, error) {

@@ -1,0 +1,21 @@
+# IRSA role bindings, substituted by the deploy pipeline from Terraform outputs
+# `server_role_arn` and `worker_role_arn`.
+#
+# Two separate roles, not one shared role. The worker role grants no AWS
+# permissions at all, so a compromised worker pod cannot read the database
+# credential that the server pods can.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chronos-server
+  namespace: chronos
+  annotations:
+    eks.amazonaws.com/role-arn: "${CHRONOS_SERVER_ROLE_ARN}"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chronos-worker
+  namespace: chronos
+  annotations:
+    eks.amazonaws.com/role-arn: "${CHRONOS_WORKER_ROLE_ARN}"

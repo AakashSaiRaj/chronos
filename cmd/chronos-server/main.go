@@ -35,6 +35,9 @@ func main() {
 	// the final image, which keeps it distroless-friendly.
 	healthcheck := flag.String("healthcheck", "", "probe the given URL and exit 0 when healthy")
 	showVersion := flag.Bool("version", false, "print the build version and exit")
+	// -migrate runs migrations and exits, so a Kubernetes Job can own schema
+	// changes instead of every replica racing to apply them on startup.
+	migrateOnly := flag.Bool("migrate", false, "apply pending migrations and exit")
 	flag.Parse()
 
 	if *showVersion {
@@ -50,11 +53,54 @@ func main() {
 		return
 	}
 
+	if *migrateOnly {
+		if err := runMigrations(); err != nil {
+			fmt.Fprintf(os.Stderr, "chronos-server -migrate: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := run(); err != nil {
 		// slog may not be configured yet, so write plainly to stderr.
 		fmt.Fprintf(os.Stderr, "chronos-server: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// runMigrations applies pending migrations and exits.
+//
+// Kubernetes runs this as a Job before a rollout, so exactly one process changes
+// the schema. The advisory lock in store.Migrate already makes concurrent runners
+// safe, but a dedicated Job also gives the rollout a clear failure point: a bad
+// migration stops the deploy instead of crash-looping every replica.
+func runMigrations() error {
+	cfg, err := config.LoadServer()
+	if err != nil {
+		return err
+	}
+	logger := config.NewLogger(cfg.Logging)
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	ctx, cancelTimeout := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancelTimeout()
+
+	db, err := store.Open(ctx, store.Config{
+		DatabaseURL:    cfg.DatabaseURL,
+		MaxConns:       2,
+		ConnectTimeout: cfg.DBConnectTimeout,
+	}, logger)
+	if err != nil {
+		return fmt.Errorf("connect to database: %w", err)
+	}
+	defer db.Close()
+
+	if err := store.Migrate(ctx, db.Pool(), logger); err != nil {
+		return fmt.Errorf("apply migrations: %w", err)
+	}
+	logger.Info("migrations complete")
+	return nil
 }
 
 func run() error {

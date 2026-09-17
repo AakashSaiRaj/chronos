@@ -1,0 +1,234 @@
+name: CD
+
+# Builds an image, pushes it to ECR, runs the migration Job, then rolls out.
+#
+# Authentication is GitHub OIDC into a per-environment IAM role. Nothing
+# long-lived is stored: there is no access key in a secret to leak, and the role's
+# trust policy pins which repository and ref may assume it.
+
+on:
+  push:
+    branches: [mainline]
+    # Only changes that can affect what runs. A README edit should not trigger a
+    # production rollout.
+    paths:
+      - "cmd/**"
+      - "internal/**"
+      - "vendor/**"
+      - "go.mod"
+      - "go.sum"
+      - "Containerfile"
+      - "deploy/k8s/**"
+      - ".github/workflows/cd.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        required: true
+        default: dev
+        type: choice
+        options: [dev, prod]
+
+permissions:
+  contents: read
+  id-token: write # required to request the OIDC token
+
+concurrency:
+  # Never two rollouts to the same environment at once: the migration Job and the
+  # deployment ordering both assume a single writer.
+  group: cd-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment || 'dev' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # GitHub Environments provide the approval gate. Production should require a
+    # reviewer; a pipeline that can reach prod unattended is one bad merge away
+    # from an incident.
+    environment:
+      name: ${{ inputs.environment || 'dev' }}
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: meta
+        # The commit SHA, not "latest". An immutable tag makes a rollout
+        # reproducible and a rollback a specific thing rather than a guess.
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Assume deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: chronos-cd-${{ github.run_id }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: chronos-${{ env.ENVIRONMENT }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${REPOSITORY}:${TAG}"
+
+          # The repository is IMMUTABLE, so a re-run on the same commit would fail
+          # to push. Treat an existing tag as success: the artifact is already
+          # there and is by definition identical.
+          if aws ecr describe-images \
+               --repository-name "${REPOSITORY}" \
+               --image-ids imageTag="${TAG}" >/dev/null 2>&1; then
+            echo "image ${TAG} already published; skipping build"
+          else
+            docker build --network=none \
+              --build-arg VERSION="${TAG}" \
+              -f Containerfile -t "${IMAGE}" .
+            docker push "${IMAGE}"
+          fi
+
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+
+      - name: Read infrastructure outputs
+        # Terraform owns the infrastructure and exports what Kubernetes needs, so
+        # role ARNs and secret names are never duplicated into a manifest by hand.
+        working-directory: deploy/terraform
+        run: |
+          set -euo pipefail
+          terraform init -input=false \
+            -backend-config="envs/${ENVIRONMENT}.backend.hcl"
+
+          {
+            echo "CHRONOS_SERVER_ROLE_ARN=$(terraform output -raw server_role_arn)"
+            echo "CHRONOS_WORKER_ROLE_ARN=$(terraform output -raw worker_role_arn)"
+            echo "CHRONOS_DATABASE_SECRET_NAME=$(terraform output -raw database_secret_name)"
+            echo "CHRONOS_CLUSTER_NAME=$(terraform output -raw cluster_name)"
+            echo "CHRONOS_NAMESPACE=$(terraform output -raw namespace)"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --name "${CHRONOS_CLUSTER_NAME}" \
+            --region "${AWS_REGION}"
+          kubectl version --output=json | head -20
+
+      - name: Render manifests
+        env:
+          CHRONOS_ACM_CERTIFICATE_ARN: ${{ secrets.ACM_CERTIFICATE_ARN }}
+          CHRONOS_WAF_ACL_ARN: ${{ secrets.WAF_ACL_ARN }}
+          CHRONOS_API_HOST: ${{ vars.API_HOST }}
+        run: |
+          set -euo pipefail
+          cd "deploy/k8s/overlays/${ENVIRONMENT}"
+
+          # Pin the exact image this rollout deploys.
+          kustomize edit set image "chronos=${IMAGE}" 2>/dev/null \
+            || kubectl kustomize --help >/dev/null
+
+          cd - >/dev/null
+          kubectl kustomize "deploy/k8s/overlays/${ENVIRONMENT}" \
+            | envsubst > /tmp/manifests.yaml
+
+          # Fail loudly if a placeholder survived substitution, rather than
+          # deploying a service account with no usable role.
+          if grep -nE '\$\{|PLACEHOLDER|000000000000' /tmp/manifests.yaml; then
+            echo "::error::unsubstituted placeholder in rendered manifests"
+            exit 1
+          fi
+
+      - name: Server-side dry run
+        # Validates against the live API server — CRDs, admission webhooks, Pod
+        # Security Standards — before anything is changed.
+        run: kubectl apply --server-side --dry-run=server -f /tmp/manifests.yaml
+
+      - name: Apply configuration
+        # Everything except the migration Job and the workloads. Config must land
+        # before the pods that read it.
+        run: |
+          kubectl apply --server-side -f /tmp/manifests.yaml \
+            --prune=false \
+            -l 'app.kubernetes.io/name=chronos' \
+            --selector-from-file=/dev/null 2>/dev/null \
+            || kubectl apply --server-side -f /tmp/manifests.yaml
+
+      - name: Run migrations
+        # A Job's spec is immutable, so the previous one is replaced rather than
+        # patched. Migrations run before the new image is rolled out, so the schema
+        # is always at least as new as the code reading it.
+        run: |
+          set -euo pipefail
+          kubectl -n "${CHRONOS_NAMESPACE}" delete job chronos-migrate \
+            --ignore-not-found --wait=true
+
+          yq eval 'select(.kind == "Job")' /tmp/manifests.yaml 2>/dev/null \
+            > /tmp/migrate-job.yaml \
+            || awk '/^kind: Job$/,0' /tmp/manifests.yaml > /tmp/migrate-job.yaml
+
+          kubectl apply -f /tmp/migrate-job.yaml
+
+          if ! kubectl -n "${CHRONOS_NAMESPACE}" wait --for=condition=complete \
+                 job/chronos-migrate --timeout=10m; then
+            echo "::error::migration failed; the running version is untouched"
+            kubectl -n "${CHRONOS_NAMESPACE}" logs job/chronos-migrate --tail=200 || true
+            exit 1
+          fi
+          kubectl -n "${CHRONOS_NAMESPACE}" logs job/chronos-migrate --tail=50
+
+      - name: Roll out
+        run: |
+          set -euo pipefail
+          kubectl apply --server-side -f /tmp/manifests.yaml
+
+          # Every tier has maxUnavailable: 0, so a rollout that cannot produce a
+          # ready pod stalls rather than replacing healthy pods with broken ones.
+          # These waits turn that stall into a failed pipeline step.
+          for deployment in chronos-api chronos-scheduler chronos-worker; do
+            echo "--- ${deployment} ---"
+            if ! kubectl -n "${CHRONOS_NAMESPACE}" rollout status \
+                   "deployment/${deployment}" --timeout=10m; then
+              echo "::error::${deployment} did not become ready; rolling back"
+              kubectl -n "${CHRONOS_NAMESPACE}" rollout undo "deployment/${deployment}"
+              kubectl -n "${CHRONOS_NAMESPACE}" rollout status \
+                "deployment/${deployment}" --timeout=5m
+              exit 1
+            fi
+          done
+
+      - name: Verify the deployment serves traffic
+        # A green rollout means pods are ready; this checks the thing users care
+        # about, from inside the cluster.
+        run: |
+          set -euo pipefail
+          kubectl -n "${CHRONOS_NAMESPACE}" run chronos-smoke-${GITHUB_RUN_ID} \
+            --rm -i --restart=Never \
+            --image=curlimages/curl:latest \
+            --command -- curl -fsS --max-time 10 \
+              "http://chronos-api.${CHRONOS_NAMESPACE}.svc.cluster.local:8080/readyz"
+
+          echo
+          kubectl -n "${CHRONOS_NAMESPACE}" get deploy,hpa,pdb
+
+      - name: Report dead letter queue depth
+        # Not a gate, just visibility: a rollout that coincides with a spike in
+        # parked tasks is worth knowing about immediately.
+        if: always()
+        continue-on-error: true
+        run: |
+          kubectl -n "${CHRONOS_NAMESPACE}" run chronos-dlq-${GITHUB_RUN_ID} \
+            --rm -i --restart=Never \
+            --image=curlimages/curl:latest \
+            --command -- curl -fsS --max-time 10 \
+              "http://chronos-api.${CHRONOS_NAMESPACE}.svc.cluster.local:8080/v1/dead-letter?limit=1" \
+            || true

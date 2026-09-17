@@ -1,0 +1,54 @@
+# Ingress for the API tier, via the AWS Load Balancer Controller.
+#
+# Only the API tier is exposed. The scheduler has no Service at all, and the
+# workers expose only a health port that nothing outside the namespace can reach —
+# the network policy denies it.
+#
+# Prod only: dev is reached with `kubectl port-forward`, which avoids paying for a
+# load balancer and avoids putting a development environment on the internet.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chronos-api
+  namespace: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+    app.kubernetes.io/component: api
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    # IP targets go straight to the pod, so the load balancer's health checks and
+    # the readiness probe agree about which pods are in service.
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # TLS terminates at the load balancer. Substituted by the deploy pipeline.
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: "${CHRONOS_ACM_CERTIFICATE_ARN}"
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+
+    # Health checks hit /readyz, the same endpoint Kubernetes uses, so the load
+    # balancer and the cluster cannot disagree about readiness.
+    alb.ingress.kubernetes.io/healthcheck-path: /readyz
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "10"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+
+    # Drain connections on deregistration, so a rolling deploy does not cut
+    # requests that are already in flight.
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+
+    alb.ingress.kubernetes.io/load-balancer-attributes: routing.http2.enabled=true
+    alb.ingress.kubernetes.io/wafv2-acl-arn: "${CHRONOS_WAF_ACL_ARN}"
+spec:
+  ingressClassName: alb
+  rules:
+    - host: "${CHRONOS_API_HOST}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: chronos-api
+                port:
+                  name: http

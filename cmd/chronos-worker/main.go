@@ -72,6 +72,14 @@ func run() error {
 		return err
 	}
 
+	// Probes come up before anything that can block. A worker waiting for the
+	// control plane during a cold start must answer liveness (the process is
+	// healthy) while failing readiness (it is not registered yet); if the endpoint
+	// only appeared after registration, Kubernetes would kill it mid-wait.
+	if err := w.ServeHealth(ctx); err != nil {
+		return fmt.Errorf("start worker health endpoint: %w", err)
+	}
+
 	if err := waitForServer(ctx, api, logger); err != nil {
 		return err
 	}

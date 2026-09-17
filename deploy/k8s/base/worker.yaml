@@ -1,0 +1,226 @@
+# Worker pool: executes activities. This is the tier that autoscales.
+#
+# Workers hold no state and reach the control plane only over HTTP, so they are
+# freely replaceable — killing one means its lease lapses and the reaper hands its
+# task to another. That property is what makes aggressive autoscaling safe here
+# and not for the other tiers.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chronos-worker
+  namespace: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+    app.kubernetes.io/component: worker
+spec:
+  # replicas is intentionally omitted: the HPA owns it. Setting it here would
+  # cause Kustomize and the HPA to fight, resetting the count on every apply.
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chronos
+      app.kubernetes.io/component: worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Workers are stateless and fungible, so a rollout can move faster than the
+      # control plane's. Still zero unavailable, so queue throughput does not dip
+      # during a deploy.
+      maxUnavailable: 0
+      maxSurge: 50%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chronos
+        app.kubernetes.io/component: worker
+    spec:
+      serviceAccountName: chronos-worker
+      automountServiceAccountToken: true
+
+      # Longer than the API's on purpose. On SIGTERM a worker stops polling
+      # immediately but lets in-flight activities finish and report. Cutting it
+      # short would abandon completed work to lease expiry, causing the task to be
+      # redone — correct, but wasteful, and visible as duplicate side effects for
+      # any activity that is not perfectly idempotent.
+      terminationGracePeriodSeconds: 60
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      topologySpreadConstraints:
+        - maxSkew: 2
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: chronos
+              app.kubernetes.io/component: worker
+
+      containers:
+        - name: worker
+          image: chronos:dev
+          imagePullPolicy: IfNotPresent
+          # entrypoint, not args: the image's ENTRYPOINT is chronos-server, and an
+          # argument would be appended to it rather than replacing it.
+          command: ["/usr/local/bin/chronos-worker"]
+
+          ports:
+            - name: health
+              containerPort: 8090
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: chronos-worker-config
+          env:
+            # Each pod registers under its own name, derived from the pod name.
+            # A shared name would make every replica upsert the same worker row and
+            # report as one worker, defeating heartbeat-based failure detection.
+            - name: CHRONOS_WORKER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+          # Liveness ignores control-plane reachability: a worker that cannot reach
+          # the API is not broken, and restarting it would only add churn.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # Readiness means registered and polling. An unready worker is not
+          # counted as available during a rollout, so a deploy cannot replace the
+          # whole fleet with pods that never managed to register.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 3
+            failureThreshold: 30
+
+          resources:
+            requests:
+              # The HPA target below is a percentage of this request, so it is the
+              # number that decides when scaling happens. Set to steady-state usage
+              # for the example activities; a fleet running real work should revisit
+              # it with Phase 4 measurements rather than by guessing.
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              # Again no CPU limit: throttling a worker mid-activity would push it
+              # toward its task timeout and its lease expiry, turning a busy pod
+              # into a failed task.
+              memory: 512Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: chronos-worker
+  namespace: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+    app.kubernetes.io/component: worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: chronos-worker
+
+  minReplicas: 2
+  maxReplicas: 20
+
+  metrics:
+    # CPU utilisation, with a caveat worth stating: it is a proxy for queue depth,
+    # not a measure of it. A worker blocked on a slow downstream call uses almost
+    # no CPU while the queue backs up behind it, so this scales well for
+    # compute-bound activities and poorly for I/O-bound ones.
+    #
+    # The right signal is claimable task count, which needs a custom metrics
+    # adapter (KEDA, or prometheus-adapter over the metrics Phase 4 adds). Left as
+    # CPU here rather than pretending otherwise.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+  behavior:
+    scaleUp:
+      # React fast: a backed-up queue is latency users can see, and a spare worker
+      # that finds nothing to do costs one idle poll.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+      selectPolicy: Max
+
+    scaleDown:
+      # Scale down slowly and deliberately. Every worker removed mid-activity
+      # abandons in-flight work to lease expiry, so thrashing here manifests as
+      # tasks being redone. Five minutes of stability before shrinking.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: chronos-worker
+  namespace: chronos
+  labels:
+    app.kubernetes.io/name: chronos
+    app.kubernetes.io/component: worker
+spec:
+  # A percentage rather than a count, because the replica count moves with the
+  # HPA. Keeps most of the fleet up during a node drain while still allowing it
+  # to proceed.
+  maxUnavailable: 25%
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chronos
+      app.kubernetes.io/component: worker

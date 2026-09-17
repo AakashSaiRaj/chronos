@@ -2,6 +2,8 @@ package config_test
 
 import (
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -32,10 +34,12 @@ func clearEnv(t *testing.T) {
 		"CHRONOS_REAPER_ENABLED", "CHRONOS_REAPER_INTERVAL", "CHRONOS_REAPER_BATCH_SIZE",
 		"CHRONOS_WORKER_TIMEOUT",
 		"CHRONOS_SHUTDOWN_TIMEOUT", "CHRONOS_LOG_LEVEL", "CHRONOS_LOG_FORMAT",
+		"CHRONOS_DATABASE_URL_FILE",
 		"CHRONOS_SERVER_URL", "CHRONOS_WORKER_NAME", "CHRONOS_TASK_QUEUE",
 		"CHRONOS_WORKER_CONCURRENCY", "CHRONOS_WORKER_POLL_INTERVAL",
 		"CHRONOS_WORKER_LEASE_DURATION", "CHRONOS_WORKER_HEARTBEAT_INTERVAL",
 		"CHRONOS_WORKER_TASK_TIMEOUT", "CHRONOS_WORKER_REQUEST_TIMEOUT",
+		"CHRONOS_WORKER_HEALTH_ADDR",
 	} {
 		t.Setenv(k, "")
 	}
@@ -252,6 +256,82 @@ func TestLoadWorkerRejectsBadValues(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
+}
+
+// TestDatabaseURLCanComeFromAFile covers how a secret manager actually delivers a
+// credential. Keeping the DSN out of the environment means it does not appear in
+// `kubectl describe`, in a crash dump, or in /proc/<pid>/environ.
+func TestDatabaseURLCanComeFromAFile(t *testing.T) {
+	const dsn = "postgres://u:p@db.internal:5432/chronos?sslmode=require"
+
+	path := filepath.Join(t.TempDir(), "database-url")
+	// With a trailing newline, as a file-mounted secret usually has.
+	require.NoError(t, os.WriteFile(path, []byte(dsn+"\n"), 0o600))
+
+	clearEnv(t)
+	setEnv(t, map[string]string{"CHRONOS_DATABASE_URL_FILE": path})
+
+	cfg, err := config.LoadServer()
+	require.NoError(t, err)
+	require.Equal(t, dsn, cfg.DatabaseURL, "the value must be trimmed and used")
+}
+
+// TestDirectDatabaseURLWinsOverFile keeps local development and compose working
+// unchanged when both forms happen to be present.
+func TestDirectDatabaseURLWinsOverFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database-url")
+	require.NoError(t, os.WriteFile(path, []byte("postgres://from-file/db"), 0o600))
+
+	clearEnv(t)
+	setEnv(t, map[string]string{
+		"CHRONOS_DATABASE_URL":      "postgres://from-env/db",
+		"CHRONOS_DATABASE_URL_FILE": path,
+	})
+
+	cfg, err := config.LoadServer()
+	require.NoError(t, err)
+	require.Equal(t, "postgres://from-env/db", cfg.DatabaseURL)
+}
+
+// TestMissingSecretFileFailsAtStartup: silently falling back to the local default
+// DSN would be far worse than refusing to start, because the process would come up
+// pointed at the wrong database.
+func TestMissingSecretFileFailsAtStartup(t *testing.T) {
+	clearEnv(t)
+	setEnv(t, map[string]string{
+		"CHRONOS_DATABASE_URL_FILE": filepath.Join(t.TempDir(), "does-not-exist"),
+	})
+
+	_, err := config.LoadServer()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "CHRONOS_DATABASE_URL_FILE")
+}
+
+func TestEmptySecretFileFailsAtStartup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database-url")
+	require.NoError(t, os.WriteFile(path, []byte("   \n"), 0o600))
+
+	clearEnv(t)
+	setEnv(t, map[string]string{"CHRONOS_DATABASE_URL_FILE": path})
+
+	_, err := config.LoadServer()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "is empty")
+}
+
+// TestWorkerHealthAddrDefaults: a worker has no other inbound surface, so if this
+// were empty by default Kubernetes would have nothing to probe.
+func TestWorkerHealthAddrDefaults(t *testing.T) {
+	clearEnv(t)
+
+	cfg, err := config.LoadWorker()
+	require.NoError(t, err)
+	require.Equal(t, ":8090", cfg.HealthAddr)
+
+	setEnv(t, map[string]string{"CHRONOS_WORKER_HEALTH_ADDR": ":9100"})
+	cfg, err = config.LoadWorker()
+	require.NoError(t, err)
+	require.Equal(t, ":9100", cfg.HealthAddr)
 }
 
 func TestNewLoggerHonoursFormatAndLevel(t *testing.T) {
