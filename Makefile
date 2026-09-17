@@ -161,6 +161,16 @@ demo: ## End-to-end demo: start server + worker, run Task A -> B -> C
 recovery-demo: ## Kill the engine mid-workflow and show it resume from persisted state
 	./scripts/recovery-demo.sh
 
+.PHONY: failure-demo
+failure-demo: ## Kill a worker mid-task; show lease reclaim, retries, dead-letter, replay
+	./scripts/failure-demo.sh
+
+.PHONY: dlq
+dlq: ## Show the dead letter queue (needs a running server)
+	@curl -fsS $(SERVER_URL)/v1/dead-letter | jq '{total, items: [.items[] | \
+		{task: .task.name, activity: .task.activity, attempts: .task.attempt, \
+		 failureReason, leaseExpiryCount, error: .task.error}]}'
+
 # ---------------------------------------------------------------------------
 # Containers
 # ---------------------------------------------------------------------------

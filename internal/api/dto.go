@@ -30,6 +30,11 @@ type TaskSpecRequest struct {
 	Input          json.RawMessage `json:"input,omitempty"`
 	MaxAttempts    int             `json:"maxAttempts,omitempty"`
 	TimeoutSeconds int             `json:"timeoutSeconds,omitempty"`
+	// RetryPolicy controls the delay between attempts. Omit for the defaults.
+	RetryPolicy *domain.RetryPolicy `json:"retryPolicy,omitempty"`
+	// MaxLeaseExpiries bounds how many times this task may be requeued because
+	// the worker holding it vanished, as distinct from the activity failing.
+	MaxLeaseExpiries int `json:"maxLeaseExpiries,omitempty"`
 }
 
 // toDomain converts the wire shape into the domain spec.
@@ -43,12 +48,14 @@ func (r RegisterWorkflowRequest) toDomain() domain.WorkflowSpec {
 	}
 	for _, t := range r.Tasks {
 		spec.Tasks = append(spec.Tasks, domain.TaskSpec{
-			Name:           t.Name,
-			Activity:       t.Activity,
-			DependsOn:      t.DependsOn,
-			Input:          t.Input,
-			MaxAttempts:    t.MaxAttempts,
-			TimeoutSeconds: t.TimeoutSeconds,
+			Name:             t.Name,
+			Activity:         t.Activity,
+			DependsOn:        t.DependsOn,
+			Input:            t.Input,
+			MaxAttempts:      t.MaxAttempts,
+			TimeoutSeconds:   t.TimeoutSeconds,
+			RetryPolicy:      t.RetryPolicy,
+			MaxLeaseExpiries: t.MaxLeaseExpiries,
 		})
 	}
 	return spec
@@ -177,6 +184,14 @@ type TaskResponse struct {
 	UpdatedAt      time.Time  `json:"updatedAt"`
 	StartedAt      *time.Time `json:"startedAt,omitempty"`
 	CompletedAt    *time.Time `json:"completedAt,omitempty"`
+
+	// Reliability fields.
+	Retryable         bool       `json:"retryable"`
+	CancelRequested   bool       `json:"cancelRequested,omitempty"`
+	DeadLetteredAt    *time.Time `json:"deadLetteredAt,omitempty"`
+	LeaseExpiryCount  int        `json:"leaseExpiryCount,omitempty"`
+	MaxLeaseExpiries  int        `json:"maxLeaseExpiries,omitempty"`
+	LastFailureReason string     `json:"lastFailureReason,omitempty"`
 }
 
 func newTaskResponse(t *domain.Task, includeClaimToken bool) TaskResponse {
@@ -201,6 +216,13 @@ func newTaskResponse(t *domain.Task, includeClaimToken bool) TaskResponse {
 		UpdatedAt:      t.UpdatedAt,
 		StartedAt:      t.StartedAt,
 		CompletedAt:    t.CompletedAt,
+
+		Retryable:         t.Retryable,
+		CancelRequested:   t.CancelRequested,
+		DeadLetteredAt:    t.DeadLetteredAt,
+		LeaseExpiryCount:  t.LeaseExpiryCount,
+		MaxLeaseExpiries:  t.MaxLeaseExpiries,
+		LastFailureReason: t.LastFailureReason,
 	}
 	if includeClaimToken && t.ClaimToken != nil {
 		resp.ClaimToken = t.ClaimToken.String()
@@ -227,6 +249,66 @@ type CompleteTaskRequest struct {
 type FailTaskRequest struct {
 	ClaimToken string `json:"claimToken"`
 	Error      string `json:"error"`
+	// Retryable, when explicitly false, sends the task straight to the dead
+	// letter queue instead of burning its remaining attempts on a failure the
+	// worker already knows is permanent. A pointer so that omitting it means
+	// "retryable" rather than "permanent", which is the safer default.
+	Retryable *bool `json:"retryable,omitempty"`
+	// Reason categorizes the failure, e.g. TIMEOUT. Defaults to ACTIVITY_ERROR.
+	Reason string `json:"reason,omitempty"`
+}
+
+// HeartbeatTaskRequest is the body of POST /v1/tasks/{id}/heartbeat.
+type HeartbeatTaskRequest struct {
+	ClaimToken string `json:"claimToken"`
+	// LeaseSeconds is how much further the worker asks to hold the task.
+	LeaseSeconds int `json:"leaseSeconds,omitempty"`
+}
+
+// HeartbeatTaskResponse tells a worker whether to keep going.
+type HeartbeatTaskResponse struct {
+	TaskID uuid.UUID `json:"taskId"`
+	// CancelRequested is the cooperative-cancellation signal. A worker that sees
+	// it should abandon the task; its result will be rejected regardless.
+	CancelRequested bool       `json:"cancelRequested"`
+	LeaseExpiresAt  *time.Time `json:"leaseExpiresAt,omitempty"`
+	Attempt         int        `json:"attempt"`
+}
+
+// ReplayTaskRequest is the body of POST /v1/tasks/{id}/replay.
+type ReplayTaskRequest struct {
+	// ExtraAttempts is how much attempt budget the replay grants. Defaults to 1.
+	ExtraAttempts int `json:"extraAttempts,omitempty"`
+}
+
+// DeadLetterResponse is the operator's view of the dead letter queue.
+type DeadLetterResponse struct {
+	Items []DeadLetterItem `json:"items"`
+	Count int              `json:"count"`
+	// Total is the size of the whole queue, not just this page, so an operator
+	// can see the backlog without paging through it.
+	Total int `json:"total"`
+}
+
+// DeadLetterItem is a parked task plus the context needed to triage it.
+type DeadLetterItem struct {
+	Task TaskResponse `json:"task"`
+	// FailureReason distinguishes an activity error from a lost worker, which the
+	// error string alone does not.
+	FailureReason  string     `json:"failureReason,omitempty"`
+	DeadLetteredAt *time.Time `json:"deadLetteredAt,omitempty"`
+	// LeaseExpiryCount being non-zero means work was redone because workers
+	// vanished, not because the activity kept failing.
+	LeaseExpiryCount int `json:"leaseExpiryCount"`
+}
+
+func newDeadLetterItem(t *domain.Task) DeadLetterItem {
+	return DeadLetterItem{
+		Task:             newTaskResponse(t, false),
+		FailureReason:    t.LastFailureReason,
+		DeadLetteredAt:   t.DeadLetteredAt,
+		LeaseExpiryCount: t.LeaseExpiryCount,
+	}
 }
 
 // ---------------------------------------------------------------------------

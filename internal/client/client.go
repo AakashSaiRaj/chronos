@@ -18,6 +18,8 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -307,11 +309,93 @@ func (c *Client) CompleteTask(ctx context.Context, taskID uuid.UUID, claimToken 
 	return &out, nil
 }
 
+// FailRequest reports a failed attempt.
+type FailRequest struct {
+	ClaimToken string `json:"claimToken"`
+	Error      string `json:"error"`
+	// Retryable, when set to false, sends the task straight to the dead letter
+	// queue instead of consuming its remaining attempts on a failure the worker
+	// already knows is permanent.
+	Retryable *bool `json:"retryable,omitempty"`
+	// Reason categorizes the failure: ACTIVITY_ERROR (default) or TIMEOUT.
+	Reason string `json:"reason,omitempty"`
+}
+
 // FailTask reports a failed attempt.
-func (c *Client) FailTask(ctx context.Context, taskID uuid.UUID, claimToken, failure string) (*TaskResponse, error) {
-	body := map[string]any{"claimToken": claimToken, "error": failure}
+func (c *Client) FailTask(ctx context.Context, taskID uuid.UUID, req FailRequest) (*TaskResponse, error) {
 	var out TaskResponse
-	if err := c.do(ctx, http.MethodPost, "/v1/tasks/"+taskID.String()+"/fail", nil, body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/v1/tasks/"+taskID.String()+"/fail", nil, req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// HeartbeatTaskResponse is the control plane's answer to a lease renewal.
+type HeartbeatTaskResponse struct {
+	TaskID uuid.UUID `json:"taskId"`
+	// CancelRequested means the worker should abandon the task. Its result would
+	// be rejected anyway, so continuing only wastes effort.
+	CancelRequested bool       `json:"cancelRequested"`
+	LeaseExpiresAt  *time.Time `json:"leaseExpiresAt,omitempty"`
+	Attempt         int        `json:"attempt"`
+}
+
+// HeartbeatTask renews a task lease while the activity runs, and learns whether
+// cancellation has been requested.
+//
+// Returns ErrStaleClaim once the lease is gone — reaped and reassigned, or
+// canceled. That is a terminal answer: the worker must stop, because anything it
+// reports will be refused.
+func (c *Client) HeartbeatTask(ctx context.Context, taskID uuid.UUID, claimToken string, leaseSeconds int) (*HeartbeatTaskResponse, error) {
+	body := map[string]any{"claimToken": claimToken, "leaseSeconds": leaseSeconds}
+	var out HeartbeatTaskResponse
+	if err := c.do(ctx, http.MethodPost, "/v1/tasks/"+taskID.String()+"/heartbeat", nil, body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeadLetterItem is a parked task plus triage context.
+type DeadLetterItem struct {
+	Task             TaskResponse `json:"task"`
+	FailureReason    string       `json:"failureReason,omitempty"`
+	DeadLetteredAt   *time.Time   `json:"deadLetteredAt,omitempty"`
+	LeaseExpiryCount int          `json:"leaseExpiryCount"`
+}
+
+// DeadLetterResponse is the dead letter queue listing.
+type DeadLetterResponse struct {
+	Items []DeadLetterItem `json:"items"`
+	Count int              `json:"count"`
+	Total int              `json:"total"`
+}
+
+// ListDeadLetter returns tasks parked for operator attention.
+func (c *Client) ListDeadLetter(ctx context.Context, workflowName string, limit int) (*DeadLetterResponse, error) {
+	path := "/v1/dead-letter"
+	query := url.Values{}
+	if workflowName != "" {
+		query.Set("workflowName", workflowName)
+	}
+	if limit > 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+
+	var out DeadLetterResponse
+	if err := c.do(ctx, http.MethodGet, path, nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ReplayTask returns a dead-lettered task to the queue, reviving its workflow.
+func (c *Client) ReplayTask(ctx context.Context, taskID uuid.UUID, extraAttempts int) (*TaskResponse, error) {
+	body := map[string]any{"extraAttempts": extraAttempts}
+	var out TaskResponse
+	if err := c.do(ctx, http.MethodPost, "/v1/tasks/"+taskID.String()+"/replay", nil, body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

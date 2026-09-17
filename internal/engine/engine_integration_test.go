@@ -311,9 +311,11 @@ func TestPendingExecutionSurvivesEngineOutage(t *testing.T) {
 		"work accepted during an engine outage must still run once an engine returns")
 }
 
-// TestFailedTaskFailsWorkflowAndCancelsRemainder pins the failure semantics:
-// Phase 1 has no retry policy, so the first unrecoverable task failure ends the run.
-func TestFailedTaskFailsWorkflowAndCancelsRemainder(t *testing.T) {
+// TestExhaustedTaskIsDeadLetteredAndFailsWorkflow pins the failure semantics:
+// with the default single attempt, one unrecoverable failure parks the task in
+// the dead letter queue and ends the run. The parked task is deliberately left
+// in DEAD_LETTER rather than canceled, so it stays visible and replayable.
+func TestExhaustedTaskIsDeadLetteredAndFailsWorkflow(t *testing.T) {
 	h := newHarness(t)
 	h.register(t, linearSpec())
 	exec := h.start(t, "order_pipeline", `{"orderId":"A-5"}`, "")
@@ -328,7 +330,9 @@ func TestFailedTaskFailsWorkflowAndCancelsRemainder(t *testing.T) {
 	taskB := h.pollOne(t, "worker-1")
 	require.NotNil(t, taskB)
 	require.Equal(t, "task_b", taskB.Name)
-	_, err = h.svc.FailTask(h.ctx, taskB.ID, *taskB.ClaimToken, "inventory service unavailable")
+	_, err = h.svc.FailTask(h.ctx, taskB.ID, *taskB.ClaimToken, store.FailParams{
+		Error: "inventory service unavailable", Retryable: true,
+	})
 	require.NoError(t, err)
 
 	h.sweep(t)
@@ -341,8 +345,9 @@ func TestFailedTaskFailsWorkflowAndCancelsRemainder(t *testing.T) {
 
 	tasks := h.tasksByName(t, exec.ID)
 	require.Equal(t, domain.TaskCompleted, tasks["task_a"].State, "completed work is preserved")
-	require.Equal(t, domain.TaskCanceled, tasks["task_b"].State,
-		"the failed task is canceled once the run is abandoned")
+	require.Equal(t, domain.TaskDeadLetter, tasks["task_b"].State,
+		"the exhausted task is parked for operator attention, not silently canceled")
+	require.NotNil(t, tasks["task_b"].DeadLetteredAt)
 	require.Equal(t, domain.TaskCanceled, tasks["task_c"].State,
 		"downstream work must not be left dangling in the queue")
 
@@ -351,7 +356,15 @@ func TestFailedTaskFailsWorkflowAndCancelsRemainder(t *testing.T) {
 
 	events := h.eventTypes(t, exec.ID)
 	require.Contains(t, events, domain.EventTaskFailed)
+	require.Contains(t, events, domain.EventTaskDeadLettered)
 	require.Equal(t, domain.EventWorkflowFailed, events[len(events)-1])
+
+	// The parked task is visible in the dead letter queue.
+	parked, err := h.store.ListDeadLetterTasks(h.ctx, store.DeadLetterFilter{})
+	require.NoError(t, err)
+	require.Len(t, parked, 1)
+	require.Equal(t, "task_b", parked[0].Name)
+	require.Contains(t, parked[0].Error, "inventory service unavailable")
 }
 
 func TestCancelExecutionStopsScheduling(t *testing.T) {

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -412,12 +413,153 @@ func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	task, err := s.svc.FailTask(r.Context(), id, token, strings.TrimSpace(req.Error))
+	// Absent means retryable: assuming a failure is permanent would silently skip
+	// the retry policy the workflow author configured.
+	retryable := true
+	if req.Retryable != nil {
+		retryable = *req.Retryable
+	}
+	reason, err := parseFailureReason(req.Reason)
+	if err != nil {
+		writeError(w, r, s.logger, err)
+		return
+	}
+
+	task, err := s.svc.FailTask(r.Context(), id, token, store.FailParams{
+		Error:     strings.TrimSpace(req.Error),
+		Reason:    reason,
+		Retryable: retryable,
+	})
 	if err != nil {
 		writeError(w, r, s.logger, err)
 		return
 	}
 	writeJSON(w, r, s.logger, http.StatusOK, newTaskResponse(task, false))
+}
+
+// handleHeartbeatTask renews a task lease and relays cancellation.
+//
+// This is the highest-frequency write in the system for long-running tasks, and
+// it doubles as the cooperative-cancellation channel: the worker is already
+// checking in, so telling it to stop costs no extra round trip.
+func (s *Server) handleHeartbeatTask(w http.ResponseWriter, r *http.Request) {
+	id, err := pathUUID(r, "id")
+	if err != nil {
+		writeError(w, r, s.logger, err)
+		return
+	}
+
+	var req HeartbeatTaskRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, r, s.logger, err)
+		return
+	}
+	token, err := parseClaimToken(req.ClaimToken)
+	if err != nil {
+		writeError(w, r, s.logger, err)
+		return
+	}
+	if req.LeaseSeconds < 0 || req.LeaseSeconds > 3600 {
+		writeError(w, r, s.logger, badRequest("leaseSeconds must be between 0 and 3600"))
+		return
+	}
+
+	beat, err := s.svc.HeartbeatTask(r.Context(), id, token,
+		time.Duration(req.LeaseSeconds)*time.Second)
+	if err != nil {
+		writeError(w, r, s.logger, err)
+		return
+	}
+	writeJSON(w, r, s.logger, http.StatusOK, HeartbeatTaskResponse{
+		TaskID:          beat.Task.ID,
+		CancelRequested: beat.CancelRequested,
+		LeaseExpiresAt:  beat.LeaseExpiresAt,
+		Attempt:         beat.Task.Attempt,
+	})
+}
+
+// handleListDeadLetter serves the operator's triage view.
+func (s *Server) handleListDeadLetter(w http.ResponseWriter, r *http.Request) {
+	limit, err := queryInt(r, "limit", 50, 1, 500)
+	if err != nil {
+		writeError(w, r, s.logger, err)
+		return
+	}
+	offset, err := queryInt(r, "offset", 0, 0, 1_000_000)
+	if err != nil {
+		writeError(w, r, s.logger, err)
+		return
+	}
+
+	tasks, err := s.svc.ListDeadLetterTasks(r.Context(), store.DeadLetterFilter{
+		WorkflowName: strings.TrimSpace(r.URL.Query().Get("workflowName")),
+		Activity:     strings.TrimSpace(r.URL.Query().Get("activity")),
+		Limit:        limit,
+		Offset:       offset,
+	})
+	if err != nil {
+		writeError(w, r, s.logger, err)
+		return
+	}
+	total, err := s.svc.CountDeadLetterTasks(r.Context())
+	if err != nil {
+		writeError(w, r, s.logger, err)
+		return
+	}
+
+	items := make([]DeadLetterItem, 0, len(tasks))
+	for i := range tasks {
+		items = append(items, newDeadLetterItem(&tasks[i]))
+	}
+	writeJSON(w, r, s.logger, http.StatusOK, DeadLetterResponse{
+		Items: items, Count: len(items), Total: total,
+	})
+}
+
+// handleReplayTask returns a dead-lettered task to the queue.
+func (s *Server) handleReplayTask(w http.ResponseWriter, r *http.Request) {
+	id, err := pathUUID(r, "id")
+	if err != nil {
+		writeError(w, r, s.logger, err)
+		return
+	}
+
+	// A body is optional; only a malformed one is an error.
+	var req ReplayTaskRequest
+	if r.ContentLength != 0 {
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, r, s.logger, err)
+			return
+		}
+	}
+	if req.ExtraAttempts < 0 || req.ExtraAttempts > 100 {
+		writeError(w, r, s.logger, badRequest("extraAttempts must be between 0 and 100"))
+		return
+	}
+
+	task, err := s.svc.ReplayTask(r.Context(), id, req.ExtraAttempts)
+	if err != nil {
+		writeError(w, r, s.logger, err)
+		return
+	}
+	writeJSON(w, r, s.logger, http.StatusOK, newTaskResponse(task, false))
+}
+
+// parseFailureReason validates a caller-supplied failure category.
+func parseFailureReason(raw string) (domain.FailureReason, error) {
+	raw = strings.ToUpper(strings.TrimSpace(raw))
+	switch domain.FailureReason(raw) {
+	case "":
+		return domain.FailureActivityError, nil
+	case domain.FailureActivityError, domain.FailureTimeout:
+		return domain.FailureReason(raw), nil
+	case domain.FailureLeaseExpired, domain.FailureWorkerDead:
+		// These are conclusions the control plane draws from silence. A worker
+		// claiming them would be reporting on its own death.
+		return "", badRequest(fmt.Sprintf("reason %q is set by the engine, not by workers", raw))
+	default:
+		return "", badRequest(fmt.Sprintf("unknown reason %q; use ACTIVITY_ERROR or TIMEOUT", raw))
+	}
 }
 
 func parseClaimToken(raw string) (uuid.UUID, error) {

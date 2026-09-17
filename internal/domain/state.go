@@ -26,17 +26,32 @@ const (
 )
 
 // ValidWorkflowTransitions is the complete set of legal workflow transitions.
+//
+// FAILED -> RUNNING exists solely for operator-initiated replay of a
+// dead-lettered task. The engine never makes that move on its own: a run it has
+// given up on stays given up on unless a human asks for it back. COMPLETED and
+// CANCELED remain absolutely terminal.
 var ValidWorkflowTransitions = map[WorkflowState][]WorkflowState{
 	WorkflowPending:   {WorkflowRunning, WorkflowCanceled, WorkflowFailed},
 	WorkflowRunning:   {WorkflowCompleted, WorkflowFailed, WorkflowCanceled},
+	WorkflowFailed:    {WorkflowRunning},
+	WorkflowCompleted: {},
+	WorkflowCanceled:  {},
+}
+
+// terminalWorkflowStates is the set the engine treats as "do not touch". FAILED
+// is included even though replay can revive it, because only an explicit
+// operator action may do so.
+var terminalWorkflowStates = map[WorkflowState]struct{}{
 	WorkflowCompleted: {},
 	WorkflowFailed:    {},
 	WorkflowCanceled:  {},
 }
 
-// IsTerminal reports whether the state admits no further transitions.
+// IsTerminal reports whether the engine should consider the execution finished.
 func (s WorkflowState) IsTerminal() bool {
-	return len(ValidWorkflowTransitions[s]) == 0 && s.Valid()
+	_, ok := terminalWorkflowStates[s]
+	return ok
 }
 
 // Valid reports whether s is a known workflow state.
@@ -85,26 +100,35 @@ const (
 	TaskRunning TaskState = "RUNNING"
 	// TaskCompleted means a worker reported success.
 	TaskCompleted TaskState = "COMPLETED"
-	// TaskFailed means the task exhausted its attempts.
+	// TaskFailed means an attempt failed. It is not terminal: a retry policy
+	// with attempts remaining will revive it.
 	TaskFailed TaskState = "FAILED"
+	// TaskDeadLetter means every attempt was used up (or the failure was declared
+	// non-retryable) and the task has been parked for operator attention. It is
+	// terminal to the engine but can be replayed by an explicit request.
+	TaskDeadLetter TaskState = "DEAD_LETTER"
 	// TaskCanceled means the task was canceled before finishing.
 	TaskCanceled TaskState = "CANCELED"
 )
 
 // ValidTaskTransitions is the complete set of legal task transitions.
 //
-// SCHEDULED -> SCHEDULED and RUNNING -> SCHEDULED are intentionally absent as
-// self-transitions; requeue-after-lease-expiry and retry-with-backoff are
-// Phase 2 concerns and are modeled there as RUNNING -> SCHEDULED via an
-// explicit requeue operation. FAILED -> SCHEDULED is already permitted so a
-// retry policy can revive a failed attempt without a schema change.
+// Two Phase 2 paths converge on SCHEDULED. RUNNING -> SCHEDULED is a requeue,
+// used when a lease expires or the worker holding it is declared dead.
+// FAILED -> SCHEDULED is a retry, used when attempts remain. DEAD_LETTER ->
+// SCHEDULED is an operator replay.
+// CANCELED -> PENDING exists for the same reason as WorkflowFailed -> RUNNING:
+// operator replay. A task is canceled as a *consequence* of its run stopping, not
+// as a judgement about the task itself, so reviving it under an explicitly
+// revived run is coherent. A canceled workflow, by contrast, stays canceled.
 var ValidTaskTransitions = map[TaskState][]TaskState{
-	TaskPending:   {TaskScheduled, TaskCanceled},
-	TaskScheduled: {TaskRunning, TaskCanceled},
-	TaskRunning:   {TaskCompleted, TaskFailed, TaskScheduled, TaskCanceled},
-	TaskFailed:    {TaskScheduled},
-	TaskCompleted: {},
-	TaskCanceled:  {},
+	TaskPending:    {TaskScheduled, TaskCanceled},
+	TaskScheduled:  {TaskRunning, TaskCanceled},
+	TaskRunning:    {TaskCompleted, TaskFailed, TaskScheduled, TaskDeadLetter, TaskCanceled},
+	TaskFailed:     {TaskScheduled, TaskDeadLetter, TaskCanceled},
+	TaskDeadLetter: {TaskScheduled, TaskCanceled},
+	TaskCanceled:   {TaskPending},
+	TaskCompleted:  {},
 }
 
 // Valid reports whether s is a known task state.
@@ -113,10 +137,18 @@ func (s TaskState) Valid() bool {
 	return ok
 }
 
-// IsTerminal reports whether the task can never transition again.
+// IsTerminal reports whether the engine should consider the task finished.
+//
+// DEAD_LETTER counts as terminal here: the engine will not act on it again, and
+// only an explicit replay can move it. That is what stops a dead-lettered task
+// from being retried forever while still leaving a remediation path open.
 func (s TaskState) IsTerminal() bool {
-	return s == TaskCompleted || s == TaskCanceled
+	return s == TaskCompleted || s == TaskCanceled || s == TaskDeadLetter
 }
+
+// IsRetryable reports whether a task in this state is a candidate for the
+// engine's retry pass.
+func (s TaskState) IsRetryable() bool { return s == TaskFailed }
 
 // CanTransitionTo reports whether s -> next is legal.
 func (s TaskState) CanTransitionTo(next TaskState) bool {

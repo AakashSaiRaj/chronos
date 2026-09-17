@@ -13,10 +13,20 @@ import (
 // DefaultTaskQueue is used when a definition does not name a queue.
 const DefaultTaskQueue = "default"
 
-// maxAttemptsCeiling bounds a task's configured attempts. Retry execution
-// itself is Phase 2; Phase 1 persists the policy so Phase 2 can honour it
-// without a schema migration.
+// DefaultMaxLeaseExpiries is how many times a task may be requeued because the
+// worker holding it vanished. Three tolerates a rolling restart or a couple of
+// unlucky evictions without letting a task that reliably kills its worker cycle
+// forever.
+const DefaultMaxLeaseExpiries = 3
+
+// maxAttemptsCeiling bounds a task's configured attempts, so a typo cannot turn
+// a failing task into an unbounded retry loop against a downstream dependency.
 const maxAttemptsCeiling = 100
+
+// maxTaskTimeoutSeconds bounds a single attempt at 24h. A task claiming a longer
+// budget almost certainly means a misconfiguration, and it would hold a lease
+// (and a worker slot) for that entire time.
+const maxTaskTimeoutSeconds = 24 * 60 * 60
 
 var nameRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$`)
 
@@ -36,6 +46,15 @@ type TaskSpec struct {
 	MaxAttempts int `json:"maxAttempts,omitempty"`
 	// TimeoutSeconds bounds a single attempt. Zero means the engine default.
 	TimeoutSeconds int `json:"timeoutSeconds,omitempty"`
+	// RetryPolicy controls the delay between attempts. Nil means the engine
+	// defaults, and stays nil in the canonical form so that adding retry support
+	// did not change the spec hash of any already-registered workflow.
+	RetryPolicy *RetryPolicy `json:"retryPolicy,omitempty"`
+	// MaxLeaseExpiries bounds how many times this task may be requeued because
+	// the worker holding it vanished, as opposed to because the activity failed.
+	// Zero means the engine default. See RetryPolicy for why an unset field must
+	// stay unset in the canonical form.
+	MaxLeaseExpiries int `json:"maxLeaseExpiries,omitempty"`
 }
 
 // WorkflowSpec is a versioned, immutable workflow definition: a DAG of tasks.
@@ -107,11 +126,19 @@ func (w *WorkflowSpec) Validate() error {
 		if t.MaxAttempts < 1 || t.MaxAttempts > maxAttemptsCeiling {
 			problems = append(problems, fmt.Sprintf("task %q: maxAttempts must be in [1,%d], got %d", t.Name, maxAttemptsCeiling, t.MaxAttempts))
 		}
-		if t.TimeoutSeconds < 0 {
-			problems = append(problems, fmt.Sprintf("task %q: timeoutSeconds must be >= 0", t.Name))
+		if t.TimeoutSeconds < 0 || t.TimeoutSeconds > maxTaskTimeoutSeconds {
+			problems = append(problems, fmt.Sprintf(
+				"task %q: timeoutSeconds must be in [0,%d]", t.Name, maxTaskTimeoutSeconds))
 		}
 		if len(t.Input) > 0 && !json.Valid(t.Input) {
 			problems = append(problems, fmt.Sprintf("task %q: input is not valid JSON", t.Name))
+		}
+		if err := t.RetryPolicy.Validate(); err != nil {
+			problems = append(problems, fmt.Sprintf("task %q: %s", t.Name, err))
+		}
+		if t.MaxLeaseExpiries < 0 || t.MaxLeaseExpiries > maxAttemptsCeiling {
+			problems = append(problems, fmt.Sprintf(
+				"task %q: maxLeaseExpiries must be in [0,%d]", t.Name, maxAttemptsCeiling))
 		}
 
 		depSeen := make(map[string]struct{}, len(t.DependsOn))

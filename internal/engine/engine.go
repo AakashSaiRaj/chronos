@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -31,6 +32,12 @@ type Config struct {
 	PollInterval time.Duration
 	// BatchSize bounds how many executions one sweep considers.
 	BatchSize int
+	// Jitter is injectable so retry delays can be made exactly reproducible in
+	// tests. Note there is deliberately no injectable clock: every time-based
+	// decision is evaluated against the database clock, in the same statement as
+	// the write it guards. One clock for the whole cluster means a replica with a
+	// drifted clock cannot reap a live lease or park a retry for an hour.
+	Jitter func() float64
 }
 
 func (c Config) withDefaults() Config {
@@ -39,6 +46,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.BatchSize <= 0 {
 		c.BatchSize = 200
+	}
+	if c.Jitter == nil {
+		c.Jitter = rand.Float64
 	}
 	return c
 }
@@ -240,21 +250,27 @@ func (e *Engine) advanceExecution(
 		}
 	}
 
-	byName := make(map[string]*domain.Task, len(tasks))
-	for i := range tasks {
-		byName[tasks[i].Name] = &tasks[i]
+	// Retire failed attempts first: each either earns a retry or is parked in the
+	// dead letter queue. Doing this before the readiness scan means a retry
+	// becomes visible in the same pass that observed the failure.
+	retired, err := e.processFailedTasks(ctx, tx, exec, tasks)
+	if err != nil {
+		return err
 	}
-
-	// A task that has failed with no attempts left is fatal for the run. Phase 1
-	// has no retry policy, so max_attempts is 1 by default and the first
-	// failure surfaces here.
-	for i := range tasks {
-		t := &tasks[i]
-		if t.State == domain.TaskFailed && !t.HasAttemptsLeft() {
-			return e.failExecution(ctx, tx, exec, t)
+	if retired > 0 {
+		if tasks, err = tx.ListTasks(ctx, exec.ID); err != nil {
+			return err
 		}
 	}
 
+	// A dead-lettered task can never complete, so the run cannot either.
+	for i := range tasks {
+		if tasks[i].State == domain.TaskDeadLetter {
+			return e.failExecution(ctx, tx, exec, &tasks[i])
+		}
+	}
+
+	byName := indexTasks(tasks)
 	scheduled, err := e.scheduleReadyTasks(ctx, tx, exec, def, tasks, byName)
 	if err != nil {
 		return err
@@ -266,10 +282,7 @@ func (e *Engine) advanceExecution(
 		if tasks, err = tx.ListTasks(ctx, exec.ID); err != nil {
 			return err
 		}
-		byName = make(map[string]*domain.Task, len(tasks))
-		for i := range tasks {
-			byName[tasks[i].Name] = &tasks[i]
-		}
+		byName = indexTasks(tasks)
 	}
 
 	allDone := true
@@ -283,6 +296,107 @@ func (e *Engine) advanceExecution(
 		return e.completeExecution(ctx, tx, exec, def, byName)
 	}
 	return nil
+}
+
+func indexTasks(tasks []domain.Task) map[string]*domain.Task {
+	byName := make(map[string]*domain.Task, len(tasks))
+	for i := range tasks {
+		byName[tasks[i].Name] = &tasks[i]
+	}
+	return byName
+}
+
+// processFailedTasks decides what becomes of each FAILED task: another attempt
+// after a backoff delay, or the dead letter queue.
+//
+// The delay is written into scheduled_at rather than held as a timer, so a retry
+// pending at the moment the engine dies is still pending, at the same instant,
+// for whichever process takes over.
+func (e *Engine) processFailedTasks(
+	ctx context.Context,
+	tx *store.Store,
+	exec *domain.WorkflowExecution,
+	tasks []domain.Task,
+) (int, error) {
+	changed := 0
+	for i := range tasks {
+		t := &tasks[i]
+		if t.State != domain.TaskFailed {
+			continue
+		}
+
+		if !t.ShouldRetry() {
+			reason := domain.FailureActivityError
+			message := fmt.Sprintf("task %q exhausted its %d attempt(s): %s",
+				t.Name, t.MaxAttempts, t.Error)
+			if !t.Retryable {
+				message = fmt.Sprintf("task %q failed permanently on attempt %d: %s",
+					t.Name, t.Attempt, t.Error)
+			}
+			if t.LastFailureReason != "" {
+				reason = domain.FailureReason(t.LastFailureReason)
+			}
+
+			if _, err := tx.DeadLetterTask(ctx, t.ID, reason, message); err != nil {
+				return changed, fmt.Errorf("dead-letter task %q: %w", t.Name, err)
+			}
+			if _, err := tx.AppendEvent(ctx, store.AppendEventParams{
+				ExecutionID: exec.ID,
+				EventType:   domain.EventTaskDeadLettered,
+				TaskName:    t.Name,
+				Payload: map[string]any{
+					"taskId":      t.ID,
+					"activity":    t.Activity,
+					"attempt":     t.Attempt,
+					"maxAttempts": t.MaxAttempts,
+					"retryable":   t.Retryable,
+					"reason":      reason,
+					"error":       t.Error,
+				},
+			}); err != nil {
+				return changed, err
+			}
+			e.logger.Warn("task dead-lettered",
+				"executionId", exec.ID, "task", t.Name,
+				"attempt", t.Attempt, "retryable", t.Retryable, "error", t.Error)
+			changed++
+			continue
+		}
+
+		delay := t.RetryPolicy.BackoffFor(t.Attempt, e.cfg.Jitter())
+
+		retried, err := tx.RequeueTask(ctx, t.ID, delay, store.RequeueReason{
+			From:    domain.TaskFailed,
+			Failure: domain.FailureReason(t.LastFailureReason),
+			Error:   t.Error,
+		})
+		if err != nil {
+			return changed, fmt.Errorf("schedule retry for task %q: %w", t.Name, err)
+		}
+		if _, err := tx.AppendEvent(ctx, store.AppendEventParams{
+			ExecutionID: exec.ID,
+			EventType:   domain.EventTaskRetryScheduled,
+			TaskName:    t.Name,
+			Payload: map[string]any{
+				"taskId":            t.ID,
+				"activity":          t.Activity,
+				"attempt":           t.Attempt,
+				"maxAttempts":       t.MaxAttempts,
+				"attemptsRemaining": t.MaxAttempts - t.Attempt,
+				"backoffMs":         delay.Milliseconds(),
+				"nextAttemptAt":     retried.ScheduledAt,
+				"error":             t.Error,
+			},
+		}); err != nil {
+			return changed, err
+		}
+
+		e.logger.Info("task retry scheduled",
+			"executionId", exec.ID, "task", t.Name, "attempt", t.Attempt,
+			"backoff", delay, "nextAttemptAt", retried.ScheduledAt)
+		changed++
+	}
+	return changed, nil
 }
 
 // scheduleReadyTasks enqueues every PENDING task whose dependencies are all
@@ -330,7 +444,8 @@ func (e *Engine) scheduleReadyTasks(
 			return scheduled, fmt.Errorf("build input for task %q: %w", t.Name, err)
 		}
 
-		if _, err := tx.ScheduleTask(ctx, t.ID, input, time.Now()); err != nil {
+		// No delay: a task whose dependencies are satisfied is claimable at once.
+		if _, err := tx.ScheduleTask(ctx, t.ID, input, 0); err != nil {
 			return scheduled, fmt.Errorf("schedule task %q: %w", t.Name, err)
 		}
 		if _, err := tx.AppendEvent(ctx, store.AppendEventParams{
@@ -396,18 +511,21 @@ func (e *Engine) completeExecution(
 	return nil
 }
 
-// failExecution finalizes a run that cannot progress, canceling the tasks that
-// will now never run so nothing is left dangling in the queue.
+// failExecution finalizes a run that cannot progress.
+//
+// The dead-lettered task is left in place so an operator can still inspect and
+// replay it; only the tasks that will now never run are canceled, so nothing is
+// left dangling in the queue.
 func (e *Engine) failExecution(
 	ctx context.Context,
 	tx *store.Store,
 	exec *domain.WorkflowExecution,
 	failed *domain.Task,
 ) error {
-	reason := fmt.Sprintf("task %q failed after %d attempt(s): %s",
-		failed.Name, failed.Attempt, failed.Error)
+	reason := fmt.Sprintf("task %q was dead-lettered after %d attempt(s) [%s]: %s",
+		failed.Name, failed.Attempt, failed.LastFailureReason, failed.Error)
 
-	canceled, err := tx.CancelIncompleteTasks(ctx, exec.ID)
+	canceled, err := tx.CancelIncompleteTasksExcept(ctx, exec.ID, failed.ID)
 	if err != nil {
 		return err
 	}
@@ -420,18 +538,22 @@ func (e *Engine) failExecution(
 		EventType:   domain.EventWorkflowFailed,
 		TaskName:    failed.Name,
 		Payload: map[string]any{
-			"reason":        reason,
-			"failedTask":    failed.Name,
-			"attempt":       failed.Attempt,
-			"tasksCanceled": canceled,
-			"taskError":     failed.Error,
+			"reason":           reason,
+			"failedTask":       failed.Name,
+			"attempt":          failed.Attempt,
+			"leaseExpiryCount": failed.LeaseExpiryCount,
+			"failureReason":    failed.LastFailureReason,
+			"tasksCanceled":    canceled,
+			"taskError":        failed.Error,
+			"deadLetteredTask": failed.ID,
 		},
 	}); err != nil {
 		return err
 	}
 
 	e.logger.Warn("execution failed",
-		"executionId", exec.ID, "task", failed.Name, "error", failed.Error)
+		"executionId", exec.ID, "task", failed.Name,
+		"failureReason", failed.LastFailureReason, "error", failed.Error)
 	return nil
 }
 

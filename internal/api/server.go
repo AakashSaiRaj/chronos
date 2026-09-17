@@ -89,6 +89,12 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /v1/tasks/poll", s.handlePollTask)
 	mux.HandleFunc("POST /v1/tasks/{id}/complete", s.handleCompleteTask)
 	mux.HandleFunc("POST /v1/tasks/{id}/fail", s.handleFailTask)
+	// Lease renewal doubles as the cooperative-cancellation channel.
+	mux.HandleFunc("POST /v1/tasks/{id}/heartbeat", s.handleHeartbeatTask)
+
+	// Dead letter queue: the operator surface for tasks that could not succeed.
+	mux.HandleFunc("GET /v1/dead-letter", s.handleListDeadLetter)
+	mux.HandleFunc("POST /v1/tasks/{id}/replay", s.handleReplayTask)
 
 	return mux
 }

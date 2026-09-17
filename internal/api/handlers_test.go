@@ -43,13 +43,22 @@ type stubService struct {
 
 	pollTask     func(context.Context, engine.PollRequest) (*domain.Task, error)
 	completeTask func(context.Context, uuid.UUID, uuid.UUID, json.RawMessage) (*domain.Task, error)
-	failTask     func(context.Context, uuid.UUID, uuid.UUID, string) (*domain.Task, error)
+	failTask     func(context.Context, uuid.UUID, uuid.UUID, store.FailParams) (*domain.Task, error)
+
+	heartbeatTask  func(context.Context, uuid.UUID, uuid.UUID, time.Duration) (*engine.LeaseHeartbeat, error)
+	listDeadLetter func(context.Context, store.DeadLetterFilter) ([]domain.Task, error)
+	countDeadLtr   func(context.Context) (int, error)
+	replayTask     func(context.Context, uuid.UUID, int) (*domain.Task, error)
 
 	// lastStart records what the handler passed down, so header/body precedence
 	// can be asserted.
-	lastStart engine.StartExecutionRequest
-	lastPoll  engine.PollRequest
-	lastFiler store.ExecutionFilter
+	lastStart      engine.StartExecutionRequest
+	lastPoll       engine.PollRequest
+	lastFiler      store.ExecutionFilter
+	lastFail       store.FailParams
+	lastDLQFilter  store.DeadLetterFilter
+	lastReplayN    int
+	lastHeartbeatD time.Duration
 }
 
 func (s *stubService) Ping(context.Context) error { return s.pingErr }
@@ -157,11 +166,54 @@ func (s *stubService) CompleteTask(ctx context.Context, taskID, token uuid.UUID,
 	return &domain.Task{ID: taskID, State: domain.TaskCompleted, Output: output, Input: json.RawMessage(`{}`)}, nil
 }
 
-func (s *stubService) FailTask(ctx context.Context, taskID, token uuid.UUID, failure string) (*domain.Task, error) {
+func (s *stubService) FailTask(ctx context.Context, taskID, token uuid.UUID, p store.FailParams) (*domain.Task, error) {
+	s.lastFail = p
 	if s.failTask != nil {
-		return s.failTask(ctx, taskID, token, failure)
+		return s.failTask(ctx, taskID, token, p)
 	}
-	return &domain.Task{ID: taskID, State: domain.TaskFailed, Error: failure, Input: json.RawMessage(`{}`)}, nil
+	return &domain.Task{
+		ID: taskID, State: domain.TaskFailed, Error: p.Error,
+		Retryable: p.Retryable, LastFailureReason: string(p.Reason),
+		Input: json.RawMessage(`{}`),
+	}, nil
+}
+
+func (s *stubService) HeartbeatTask(ctx context.Context, taskID, token uuid.UUID, extendBy time.Duration) (*engine.LeaseHeartbeat, error) {
+	s.lastHeartbeatD = extendBy
+	if s.heartbeatTask != nil {
+		return s.heartbeatTask(ctx, taskID, token, extendBy)
+	}
+	expiry := time.Now().Add(extendBy)
+	return &engine.LeaseHeartbeat{
+		Task:           &domain.Task{ID: taskID, State: domain.TaskRunning, Attempt: 1},
+		LeaseExpiresAt: &expiry,
+	}, nil
+}
+
+func (s *stubService) ListDeadLetterTasks(ctx context.Context, f store.DeadLetterFilter) ([]domain.Task, error) {
+	s.lastDLQFilter = f
+	if s.listDeadLetter != nil {
+		return s.listDeadLetter(ctx, f)
+	}
+	return nil, nil
+}
+
+func (s *stubService) CountDeadLetterTasks(ctx context.Context) (int, error) {
+	if s.countDeadLtr != nil {
+		return s.countDeadLtr(ctx)
+	}
+	return 0, nil
+}
+
+func (s *stubService) ReplayTask(ctx context.Context, taskID uuid.UUID, extraAttempts int) (*domain.Task, error) {
+	s.lastReplayN = extraAttempts
+	if s.replayTask != nil {
+		return s.replayTask(ctx, taskID, extraAttempts)
+	}
+	return &domain.Task{
+		ID: taskID, State: domain.TaskScheduled, MaxAttempts: 1 + extraAttempts,
+		Input: json.RawMessage(`{}`),
+	}, nil
 }
 
 // newTestServer wires a stub behind the real router and middleware stack.

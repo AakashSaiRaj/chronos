@@ -12,7 +12,8 @@ import (
 	"github.com/AakashSaiRaj/chronos/internal/domain"
 )
 
-const workerColumns = `id, name, task_queue, activities, state, registered_at, last_heartbeat_at`
+const workerColumns = `id, name, task_queue, activities, state, registered_at, last_heartbeat_at,
+	declared_dead_at`
 
 // RegisterWorkerParams describes a worker announcing itself.
 type RegisterWorkerParams struct {
@@ -41,6 +42,9 @@ func (s *Store) RegisterWorker(ctx context.Context, p RegisterWorkerParams) (*do
 		activities = []string{}
 	}
 
+	// A worker that was previously declared dead and has now come back is
+	// resurrected rather than left marked dead: registration is itself proof of
+	// life, and the alternative is a permanently unusable worker name.
 	row := s.db.QueryRow(ctx, `
 		INSERT INTO workers (id, name, task_queue, activities, state)
 		VALUES ($1, $2, $3, $4, 'ACTIVE')
@@ -48,6 +52,7 @@ func (s *Store) RegisterWorker(ctx context.Context, p RegisterWorkerParams) (*do
 			task_queue        = EXCLUDED.task_queue,
 			activities        = EXCLUDED.activities,
 			state             = 'ACTIVE',
+			declared_dead_at  = NULL,
 			last_heartbeat_at = now()
 		RETURNING `+workerColumns,
 		uuid.New(), p.Name, p.TaskQueue, activities)
@@ -59,10 +64,14 @@ func (s *Store) RegisterWorker(ctx context.Context, p RegisterWorkerParams) (*do
 	return w, nil
 }
 
-// Heartbeat refreshes a worker's liveness timestamp.
+// Heartbeat refreshes a worker's liveness timestamp, clearing a dead marking if
+// the worker has come back.
 func (s *Store) Heartbeat(ctx context.Context, workerID uuid.UUID) (*domain.Worker, error) {
 	row := s.db.QueryRow(ctx, `
-		UPDATE workers SET last_heartbeat_at = now(), state = 'ACTIVE'
+		UPDATE workers SET
+			last_heartbeat_at = now(),
+			state             = 'ACTIVE',
+			declared_dead_at  = NULL
 		WHERE id = $1
 		RETURNING `+workerColumns, workerID)
 	w, err := scanWorker(row)
@@ -70,6 +79,55 @@ func (s *Store) Heartbeat(ctx context.Context, workerID uuid.UUID) (*domain.Work
 		return nil, translateError(err, fmt.Sprintf("heartbeat worker %s", workerID))
 	}
 	return w, nil
+}
+
+// MarkStaleWorkersDead declares ACTIVE workers dead once their heartbeat has
+// lapsed by more than threshold, returning the ones it changed.
+//
+// Detection is deliberately separate from lease expiry. A lease tells you a
+// specific task went quiet; a lapsed heartbeat tells you an entire worker did,
+// which lets the reaper reclaim all of its tasks at once instead of waiting for
+// each lease to time out individually. The threshold should be a few heartbeat
+// intervals so a single dropped request does not evict a healthy worker.
+func (s *Store) MarkStaleWorkersDead(ctx context.Context, threshold time.Duration, limit int) ([]domain.Worker, error) {
+	if threshold <= 0 {
+		threshold = time.Minute
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	rows, err := s.db.Query(ctx, `
+		UPDATE workers SET
+			state            = 'DEAD',
+			declared_dead_at = now()
+		WHERE id IN (
+			SELECT id FROM workers
+			WHERE state = 'ACTIVE'
+			  AND last_heartbeat_at < now() - ($1::int * interval '1 millisecond')
+			ORDER BY last_heartbeat_at ASC
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING `+workerColumns,
+		threshold.Milliseconds(), limit)
+	if err != nil {
+		return nil, translateError(err, "mark stale workers dead")
+	}
+	defer rows.Close()
+
+	out := []domain.Worker{}
+	for rows.Next() {
+		w, err := scanWorker(rows)
+		if err != nil {
+			return nil, translateError(err, "scan stale worker")
+		}
+		out = append(out, *w)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, translateError(err, "iterate stale workers")
+	}
+	return out, nil
 }
 
 // GetWorker fetches a worker by ID.
@@ -113,13 +171,15 @@ func (s *Store) ListWorkers(ctx context.Context, taskQueue string, limit int) ([
 
 func scanWorker(row scanner) (*domain.Worker, error) {
 	var (
-		w          domain.Worker
-		state      string
-		activities []string
-		registered time.Time
-		heartbeat  time.Time
+		w            domain.Worker
+		state        string
+		activities   []string
+		registered   time.Time
+		heartbeat    time.Time
+		declaredDead *time.Time
 	)
-	if err := row.Scan(&w.ID, &w.Name, &w.TaskQueue, &activities, &state, &registered, &heartbeat); err != nil {
+	if err := row.Scan(&w.ID, &w.Name, &w.TaskQueue, &activities, &state,
+		&registered, &heartbeat, &declaredDead); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("%w", domain.ErrNotFound)
 		}
@@ -129,5 +189,6 @@ func scanWorker(row scanner) (*domain.Worker, error) {
 	w.Activities = activities
 	w.RegisteredAt = registered
 	w.LastHeartbeatAt = heartbeat
+	w.DeclaredDeadAt = declaredDead
 	return &w, nil
 }

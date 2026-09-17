@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -35,7 +36,13 @@ type Service interface {
 
 	PollTask(ctx context.Context, req engine.PollRequest) (*domain.Task, error)
 	CompleteTask(ctx context.Context, taskID, claimToken uuid.UUID, output json.RawMessage) (*domain.Task, error)
-	FailTask(ctx context.Context, taskID, claimToken uuid.UUID, failure string) (*domain.Task, error)
+	FailTask(ctx context.Context, taskID, claimToken uuid.UUID, p store.FailParams) (*domain.Task, error)
+
+	// Reliability operations (Phase 2).
+	HeartbeatTask(ctx context.Context, taskID, claimToken uuid.UUID, extendBy time.Duration) (*engine.LeaseHeartbeat, error)
+	ListDeadLetterTasks(ctx context.Context, f store.DeadLetterFilter) ([]domain.Task, error)
+	CountDeadLetterTasks(ctx context.Context) (int, error)
+	ReplayTask(ctx context.Context, taskID uuid.UUID, extraAttempts int) (*domain.Task, error)
 }
 
 // Compile-time proof that the engine implementation satisfies the transport's

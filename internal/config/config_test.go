@@ -29,6 +29,8 @@ func clearEnv(t *testing.T) {
 		"CHRONOS_DB_MAX_CONNS", "CHRONOS_DB_MIN_CONNS", "CHRONOS_DB_CONNECT_TIMEOUT",
 		"CHRONOS_DB_MAX_CONN_LIFETIME", "CHRONOS_ENGINE_POLL_INTERVAL",
 		"CHRONOS_ENGINE_BATCH_SIZE", "CHRONOS_ENGINE_ENABLED", "CHRONOS_MIGRATE_ON_START",
+		"CHRONOS_REAPER_ENABLED", "CHRONOS_REAPER_INTERVAL", "CHRONOS_REAPER_BATCH_SIZE",
+		"CHRONOS_WORKER_TIMEOUT",
 		"CHRONOS_SHUTDOWN_TIMEOUT", "CHRONOS_LOG_LEVEL", "CHRONOS_LOG_FORMAT",
 		"CHRONOS_SERVER_URL", "CHRONOS_WORKER_NAME", "CHRONOS_TASK_QUEUE",
 		"CHRONOS_WORKER_CONCURRENCY", "CHRONOS_WORKER_POLL_INTERVAL",
@@ -56,6 +58,48 @@ func TestLoadServerDefaults(t *testing.T) {
 	require.True(t, cfg.MigrateOnStart, "migrations must apply by default for local runs")
 	require.Equal(t, slog.LevelInfo, cfg.Logging.Level)
 	require.Equal(t, "text", cfg.Logging.Format)
+
+	// Failure detection must be on by default: a Chronos with no reaper silently
+	// loses any task whose worker dies.
+	require.True(t, cfg.ReaperEnabled, "the reaper must run by default")
+	require.Equal(t, time.Second, cfg.ReaperInterval)
+	require.Equal(t, 100, cfg.ReaperBatchSize)
+	require.Equal(t, 45*time.Second, cfg.WorkerTimeout)
+	require.Less(t, cfg.ReaperInterval, cfg.WorkerTimeout,
+		"sweeping less often than the detection threshold would make it meaningless")
+}
+
+func TestLoadServerReadsReaperSettings(t *testing.T) {
+	clearEnv(t)
+	setEnv(t, map[string]string{
+		"CHRONOS_REAPER_ENABLED":    "false",
+		"CHRONOS_REAPER_INTERVAL":   "250ms",
+		"CHRONOS_REAPER_BATCH_SIZE": "500",
+		"CHRONOS_WORKER_TIMEOUT":    "20s",
+	})
+
+	cfg, err := config.LoadServer()
+	require.NoError(t, err)
+	require.False(t, cfg.ReaperEnabled)
+	require.Equal(t, 250*time.Millisecond, cfg.ReaperInterval)
+	require.Equal(t, 500, cfg.ReaperBatchSize)
+	require.Equal(t, 20*time.Second, cfg.WorkerTimeout)
+}
+
+// TestLoadServerRejectsReaperSlowerThanDetectionThreshold catches a configuration
+// that would let a dead worker go unnoticed far longer than WorkerTimeout implies.
+func TestLoadServerRejectsReaperSlowerThanDetectionThreshold(t *testing.T) {
+	for _, interval := range []string{"45s", "2m"} {
+		clearEnv(t)
+		setEnv(t, map[string]string{
+			"CHRONOS_REAPER_INTERVAL": interval,
+			"CHRONOS_WORKER_TIMEOUT":  "45s",
+		})
+
+		_, err := config.LoadServer()
+		require.Error(t, err, "reaper interval %s vs timeout 45s must be rejected", interval)
+		require.Contains(t, err.Error(), "must be shorter than")
+	}
 }
 
 func TestLoadServerReadsEnvironment(t *testing.T) {

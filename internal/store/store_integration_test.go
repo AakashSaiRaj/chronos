@@ -211,7 +211,7 @@ func claimableTask(t *testing.T, s *store.Store) (*domain.WorkflowExecution, *do
 	tasks, err := s.ListTasks(ctx, exec.ID)
 	require.NoError(t, err)
 
-	scheduled, err := s.ScheduleTask(ctx, tasks[0].ID, json.RawMessage(`{"amount":42}`), time.Now())
+	scheduled, err := s.ScheduleTask(ctx, tasks[0].ID, json.RawMessage(`{"amount":42}`), 0)
 	require.NoError(t, err)
 	require.Equal(t, domain.TaskScheduled, scheduled.State)
 	return exec, scheduled
@@ -280,7 +280,8 @@ func TestCompleteTaskIsIdempotentAndRejectsStaleClaims(t *testing.T) {
 	require.ErrorIs(t, err, domain.ErrStaleClaim)
 
 	// Reporting a different outcome for the same attempt is a conflict.
-	_, err = s.FailTask(ctx, claimed.ID, *claimed.ClaimToken, "boom")
+	_, err = s.FailTask(ctx, claimed.ID, *claimed.ClaimToken,
+		store.FailParams{Error: "boom", Retryable: true})
 	require.ErrorIs(t, err, domain.ErrConflict)
 }
 
@@ -309,7 +310,7 @@ func TestClaimTaskUnderConcurrencyHandsOutDistinctTasks(t *testing.T) {
 	tasks, err := s.ListTasks(ctx, exec.ID)
 	require.NoError(t, err)
 	for _, task := range tasks {
-		_, err := s.ScheduleTask(ctx, task.ID, json.RawMessage(`{}`), time.Now())
+		_, err := s.ScheduleTask(ctx, task.ID, json.RawMessage(`{}`), 0)
 		require.NoError(t, err)
 	}
 

@@ -101,6 +101,15 @@ func run() error {
 		BatchSize:    cfg.EngineBatchSize,
 	}, logger)
 
+	// The reaper handles the failures a worker cannot report: it reclaims tasks
+	// whose lease lapsed and declares silent workers dead. It nudges the engine
+	// so reclaimed work is rescheduled immediately.
+	reaper := engine.NewReaper(db, engine.ReaperConfig{
+		Interval:      cfg.ReaperInterval,
+		BatchSize:     cfg.ReaperBatchSize,
+		WorkerTimeout: cfg.WorkerTimeout,
+	}, eng, logger)
+
 	// The service nudges the engine after durable writes so scheduling latency
 	// is not bounded by the poll interval.
 	svc := engine.NewService(db, eng, logger)
@@ -117,7 +126,7 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 
 	if cfg.EngineEnabled {
 		wg.Add(1)
@@ -129,6 +138,18 @@ func run() error {
 		}()
 	} else {
 		logger.Warn("engine disabled; this replica serves the API only")
+	}
+
+	if cfg.ReaperEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := reaper.Run(ctx); err != nil {
+				errCh <- fmt.Errorf("reaper: %w", err)
+			}
+		}()
+	} else {
+		logger.Warn("reaper disabled; expired leases and dead workers will not be detected")
 	}
 
 	wg.Add(1)

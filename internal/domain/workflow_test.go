@@ -97,7 +97,36 @@ func TestValidateRejectsMalformedSpecs(t *testing.T) {
 		},
 		"negative timeout": {
 			mutate:    func(s *domain.WorkflowSpec) { s.Tasks[0].TimeoutSeconds = -1 },
-			expectMsg: "timeoutSeconds must be >= 0",
+			expectMsg: "timeoutSeconds must be in",
+		},
+		"timeout beyond the ceiling": {
+			mutate:    func(s *domain.WorkflowSpec) { s.Tasks[0].TimeoutSeconds = 90_000 },
+			expectMsg: "timeoutSeconds must be in",
+		},
+		"negative maxLeaseExpiries": {
+			mutate:    func(s *domain.WorkflowSpec) { s.Tasks[0].MaxLeaseExpiries = -1 },
+			expectMsg: "maxLeaseExpiries must be in",
+		},
+		"invalid retry backoff coefficient": {
+			mutate: func(s *domain.WorkflowSpec) {
+				s.Tasks[0].RetryPolicy = &domain.RetryPolicy{BackoffCoefficient: 0.5}
+			},
+			expectMsg: "backoffCoefficient must be >= 1",
+		},
+		"retry max interval below initial": {
+			mutate: func(s *domain.WorkflowSpec) {
+				s.Tasks[0].RetryPolicy = &domain.RetryPolicy{
+					InitialIntervalMS: 10_000, MaxIntervalMS: 1_000,
+				}
+			},
+			expectMsg: "maxIntervalMs must be >= initialIntervalMs",
+		},
+		"jitter out of range": {
+			mutate: func(s *domain.WorkflowSpec) {
+				jitter := 250
+				s.Tasks[0].RetryPolicy = &domain.RetryPolicy{JitterPercent: &jitter}
+			},
+			expectMsg: "jitterPercent must be in",
 		},
 		"invalid static input": {
 			mutate:    func(s *domain.WorkflowSpec) { s.Tasks[0].Input = json.RawMessage(`{not json`) },

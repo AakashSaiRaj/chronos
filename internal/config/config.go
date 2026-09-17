@@ -42,6 +42,19 @@ type Server struct {
 	// EngineEnabled allows running an API-only replica, so the scheduler can be
 	// scaled independently of the API in Phase 3.
 	EngineEnabled bool
+
+	// ReaperEnabled turns on failure detection. Separate from the engine so the
+	// two can be scaled or rolled independently.
+	ReaperEnabled bool
+	// ReaperInterval is how often expired leases and silent workers are swept
+	// for. It bounds how long a lost task waits before being reclaimed.
+	ReaperInterval time.Duration
+	// ReaperBatchSize bounds how much one reaper pass reclaims.
+	ReaperBatchSize int
+	// WorkerTimeout is how long a worker's heartbeat may lapse before it is
+	// declared dead. Must be comfortably larger than a worker's heartbeat
+	// interval so one dropped request cannot evict a healthy worker.
+	WorkerTimeout time.Duration
 	// MigrateOnStart applies pending migrations during startup. Convenient
 	// locally; in a cluster a dedicated migration Job is preferable.
 	MigrateOnStart bool
@@ -108,6 +121,16 @@ func LoadServer() (Server, error) {
 	collect(err)
 	cfg.EngineEnabled, err = envBool("CHRONOS_ENGINE_ENABLED", true)
 	collect(err)
+
+	cfg.ReaperEnabled, err = envBool("CHRONOS_REAPER_ENABLED", true)
+	collect(err)
+	cfg.ReaperInterval, err = envDuration("CHRONOS_REAPER_INTERVAL", time.Second)
+	collect(err)
+	cfg.ReaperBatchSize, err = envInt("CHRONOS_REAPER_BATCH_SIZE", 100, 1, 10_000)
+	collect(err)
+	cfg.WorkerTimeout, err = envDuration("CHRONOS_WORKER_TIMEOUT", 45*time.Second)
+	collect(err)
+
 	cfg.MigrateOnStart, err = envBool("CHRONOS_MIGRATE_ON_START", true)
 	collect(err)
 	cfg.ShutdownTimeout, err = envDuration("CHRONOS_SHUTDOWN_TIMEOUT", 20*time.Second)
@@ -123,6 +146,13 @@ func LoadServer() (Server, error) {
 		problems = append(problems,
 			fmt.Sprintf("CHRONOS_DB_MIN_CONNS (%d) must not exceed CHRONOS_DB_MAX_CONNS (%d)",
 				cfg.DBMinConns, cfg.DBMaxConns))
+	}
+	// Sweeping less often than the detection threshold would mean a dead worker
+	// could go unnoticed for far longer than WorkerTimeout implies.
+	if cfg.ReaperInterval >= cfg.WorkerTimeout {
+		problems = append(problems, fmt.Sprintf(
+			"CHRONOS_REAPER_INTERVAL (%s) must be shorter than CHRONOS_WORKER_TIMEOUT (%s)",
+			cfg.ReaperInterval, cfg.WorkerTimeout))
 	}
 
 	if len(problems) > 0 {

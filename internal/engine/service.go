@@ -43,6 +43,9 @@ type Service struct {
 
 // NewService constructs a Service. A nil notifier is allowed and means state
 // changes rely on the engine's polling sweep alone.
+//
+// There is no injectable clock here by design: every deadline the service writes
+// is computed by the database, so all replicas agree on what time it is.
 func NewService(s *store.Store, notifier Notifier, logger *slog.Logger) *Service {
 	if notifier == nil {
 		notifier = noopNotifier{}
@@ -206,6 +209,13 @@ func (svc *Service) CancelExecution(ctx context.Context, id uuid.UUID, reason st
 				domain.ErrConflict, id, exec.State)
 		}
 
+		// Signal running tasks before invalidating their claims, so the history
+		// records that workers were asked to stop rather than simply cut off.
+		signalled, err := svc.requestTaskCancellation(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+
 		canceled, err := tx.CancelIncompleteTasks(ctx, id)
 		if err != nil {
 			return err
@@ -217,7 +227,11 @@ func (svc *Service) CancelExecution(ctx context.Context, id uuid.UUID, reason st
 		_, err = tx.AppendEvent(ctx, store.AppendEventParams{
 			ExecutionID: id,
 			EventType:   domain.EventWorkflowCanceled,
-			Payload:     map[string]any{"reason": reason, "tasksCanceled": canceled},
+			Payload: map[string]any{
+				"reason":         reason,
+				"tasksCanceled":  canceled,
+				"tasksSignalled": signalled,
+			},
 		})
 		return err
 	})
@@ -324,7 +338,7 @@ func (svc *Service) PollTask(ctx context.Context, req PollRequest) (*domain.Task
 // CompleteTask records a successful task attempt and lets the engine schedule
 // whatever became ready as a result.
 func (svc *Service) CompleteTask(ctx context.Context, taskID, claimToken uuid.UUID, output json.RawMessage) (*domain.Task, error) {
-	task, err := svc.reportTask(ctx, taskID, claimToken, domain.TaskCompleted, output, "")
+	task, err := svc.reportTask(ctx, taskID, claimToken, domain.TaskCompleted, output, store.FailParams{})
 	if err != nil {
 		return nil, err
 	}
@@ -333,8 +347,12 @@ func (svc *Service) CompleteTask(ctx context.Context, taskID, claimToken uuid.UU
 }
 
 // FailTask records a failed task attempt.
-func (svc *Service) FailTask(ctx context.Context, taskID, claimToken uuid.UUID, failure string) (*domain.Task, error) {
-	task, err := svc.reportTask(ctx, taskID, claimToken, domain.TaskFailed, nil, failure)
+//
+// Whether another attempt follows is not decided here: the engine's retry pass
+// reads the task's persisted policy. A worker declaring the failure
+// non-retryable, however, short-circuits that budget entirely.
+func (svc *Service) FailTask(ctx context.Context, taskID, claimToken uuid.UUID, p store.FailParams) (*domain.Task, error) {
+	task, err := svc.reportTask(ctx, taskID, claimToken, domain.TaskFailed, nil, p)
 	if err != nil {
 		return nil, err
 	}
@@ -353,7 +371,7 @@ func (svc *Service) reportTask(
 	taskID, claimToken uuid.UUID,
 	outcome domain.TaskState,
 	output json.RawMessage,
-	failure string,
+	failure store.FailParams,
 ) (*domain.Task, error) {
 	if claimToken == uuid.Nil {
 		return nil, fmt.Errorf("%w: claimToken is required to report a task result", domain.ErrValidation)
@@ -403,6 +421,8 @@ func (svc *Service) reportTask(
 		if outcome == domain.TaskFailed {
 			payload["error"] = task.Error
 			payload["attemptsRemaining"] = task.MaxAttempts - task.Attempt
+			payload["retryable"] = task.Retryable
+			payload["failureReason"] = task.LastFailureReason
 		}
 
 		if _, err := tx.AppendEvent(ctx, store.AppendEventParams{

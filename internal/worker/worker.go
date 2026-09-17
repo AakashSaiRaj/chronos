@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -198,16 +199,119 @@ func (w *Worker) execute(ctx context.Context, logger *slog.Logger, task *client.
 	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 
+	// Renew the lease while the activity runs. Without this, every task would
+	// need a lease as long as the slowest possible activity, and a crashed
+	// worker's task would stay stuck for that entire duration. The same loop
+	// carries cancellation back from the control plane and cancels runCtx.
+	renewal := w.startLeaseRenewal(runCtx, logger, task, cancel)
+
 	started := time.Now()
 	output, runErr := invoke(runCtx, fn, input)
 	elapsed := time.Since(started)
 
-	if runErr != nil {
+	canceled, leaseLost := renewal.stop()
+
+	switch {
+	case leaseLost:
+		// The control plane already gave this task to someone else, or canceled
+		// it. Reporting would be refused, so drop the result rather than spend a
+		// round trip discovering that.
+		logger.Warn("abandoning task: lease no longer held",
+			"durationMs", elapsed.Milliseconds())
+		return
+	case canceled:
+		logger.Info("task canceled by request", "durationMs", elapsed.Milliseconds())
+		w.report(ctx, logger, task, nil,
+			fmt.Errorf("activity canceled: cancellation requested by the control plane"))
+		return
+	case runErr != nil:
 		logger.Warn("activity failed", "durationMs", elapsed.Milliseconds(), "error", runErr)
-	} else {
+	default:
 		logger.Info("activity completed", "durationMs", elapsed.Milliseconds())
 	}
 	w.report(ctx, logger, task, output, runErr)
+}
+
+// leaseRenewal tracks a background lease-renewal loop for one task attempt.
+type leaseRenewal struct {
+	done      chan struct{}
+	stopOnce  sync.Once
+	stopCh    chan struct{}
+	canceled  atomic.Bool
+	leaseLost atomic.Bool
+}
+
+// stop halts renewal and reports whether cancellation was requested and whether
+// the lease was lost.
+func (r *leaseRenewal) stop() (canceled, leaseLost bool) {
+	r.stopOnce.Do(func() { close(r.stopCh) })
+	<-r.done
+	return r.canceled.Load(), r.leaseLost.Load()
+}
+
+// startLeaseRenewal begins renewing a task's lease until stopped.
+//
+// It renews at a fraction of the lease duration so a single dropped request does
+// not cost the lease. cancelRun is invoked when the control plane asks for
+// cancellation or the lease is lost, which is what makes cancellation actually
+// interrupt a running activity rather than merely being recorded.
+func (w *Worker) startLeaseRenewal(
+	ctx context.Context,
+	logger *slog.Logger,
+	task *client.TaskResponse,
+	cancelRun context.CancelFunc,
+) *leaseRenewal {
+	r := &leaseRenewal{done: make(chan struct{}), stopCh: make(chan struct{})}
+
+	// Renew at a third of the lease, so two consecutive failures still leave a
+	// margin before the reaper would step in.
+	interval := w.cfg.LeaseDuration / 3
+	if interval < 500*time.Millisecond {
+		interval = 500 * time.Millisecond
+	}
+
+	go func() {
+		defer close(r.done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-r.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+
+			beatCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.cfg.RequestTimeout)
+			beat, err := w.client.HeartbeatTask(beatCtx, task.ID, task.ClaimToken,
+				int(w.cfg.LeaseDuration.Seconds()))
+			cancel()
+
+			switch {
+			case err == nil && beat.CancelRequested:
+				logger.Info("cancellation requested, interrupting activity")
+				r.canceled.Store(true)
+				cancelRun()
+				return
+			case err == nil:
+				// Lease extended; nothing to do.
+			case errors.Is(err, client.ErrStaleClaim):
+				logger.Warn("lease lost while running, interrupting activity", "error", err)
+				r.leaseLost.Store(true)
+				cancelRun()
+				return
+			default:
+				// A transient failure. The client already retried; keep going and
+				// try again next tick rather than abandoning work that may well
+				// still be validly leased.
+				logger.Warn("lease renewal failed", "error", err)
+			}
+		}
+	}()
+
+	return r
 }
 
 // invoke calls an activity, converting a panic into an error so one bad activity
@@ -232,7 +336,7 @@ func (w *Worker) report(ctx context.Context, logger *slog.Logger, task *client.T
 	defer cancel()
 
 	if runErr != nil {
-		if _, err := w.client.FailTask(reportCtx, task.ID, task.ClaimToken, runErr.Error()); err != nil {
+		if _, err := w.client.FailTask(reportCtx, task.ID, failRequestFor(task, runErr)); err != nil {
 			w.logReportFailure(logger, "fail", err)
 		}
 		return
@@ -240,8 +344,15 @@ func (w *Worker) report(ctx context.Context, logger *slog.Logger, task *client.T
 
 	encoded, err := encodeOutput(output)
 	if err != nil {
+		// The activity succeeded but produced something we cannot persist. That is
+		// a bug in the activity, not a transient fault, so retrying is pointless.
 		logger.Error("activity output is not JSON-encodable", "error", err)
-		if _, failErr := w.client.FailTask(reportCtx, task.ID, task.ClaimToken, err.Error()); failErr != nil {
+		permanent := false
+		if _, failErr := w.client.FailTask(reportCtx, task.ID, client.FailRequest{
+			ClaimToken: task.ClaimToken,
+			Error:      err.Error(),
+			Retryable:  &permanent,
+		}); failErr != nil {
 			w.logReportFailure(logger, "fail", failErr)
 		}
 		return
@@ -249,6 +360,28 @@ func (w *Worker) report(ctx context.Context, logger *slog.Logger, task *client.T
 	if _, err := w.client.CompleteTask(reportCtx, task.ID, task.ClaimToken, encoded); err != nil {
 		w.logReportFailure(logger, "complete", err)
 	}
+}
+
+// failRequestFor classifies an activity error for the control plane.
+//
+// A timeout is reported as such rather than as a generic error, because "the
+// activity exceeded its budget" and "the activity returned an error" call for
+// different operator responses even though both are failures.
+func failRequestFor(task *client.TaskResponse, runErr error) client.FailRequest {
+	req := client.FailRequest{
+		ClaimToken: task.ClaimToken,
+		Error:      runErr.Error(),
+	}
+	if errors.Is(runErr, context.DeadlineExceeded) {
+		req.Reason = "TIMEOUT"
+	}
+	// An unimplemented activity cannot be fixed by trying again on this worker
+	// fleet, so it goes straight to the dead letter queue for a human to look at.
+	if errors.Is(runErr, domain.ErrNotFound) {
+		permanent := false
+		req.Retryable = &permanent
+	}
+	return req
 }
 
 func (w *Worker) logReportFailure(logger *slog.Logger, kind string, err error) {
