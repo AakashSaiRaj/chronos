@@ -1,0 +1,88 @@
+# Local Chronos stack. Run with podman-compose (see Makefile targets).
+#
+#   make db-up        # Postgres only, for `go run` / `go test` on the host
+#   make stack-up     # Postgres + server + worker, all in containers
+#
+# The server and worker live in the "app" profile so `make db-up` can bring up
+# just the database without building images.
+
+services:
+  postgres:
+    image: docker.io/library/postgres:17-alpine
+    container_name: chronos-postgres
+    environment:
+      POSTGRES_USER: chronos
+      POSTGRES_PASSWORD: chronos
+      POSTGRES_DB: chronos
+      # Chronos leans on the tasks table as its queue, so claim latency is
+      # dominated by commit latency on a laptop. These settings keep local runs
+      # fast; they are not production values.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - log_min_duration_statement=500
+    # Bound to loopback on a non-default host port so Chronos never collides
+    # with a system Postgres or another local stack on 5432.
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - chronos-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chronos -d chronos"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  chronos-server:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: localhost/chronos:dev
+    container_name: chronos-server
+    # The image's ENTRYPOINT is already chronos-server.
+    environment:
+      CHRONOS_DATABASE_URL: postgres://chronos:chronos@postgres:5432/chronos?sslmode=disable
+      CHRONOS_HTTP_ADDR: ":8080"
+      CHRONOS_LOG_LEVEL: info
+    ports:
+      - "127.0.0.1:8088:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/chronos-server", "-healthcheck", "http://127.0.0.1:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  chronos-worker:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: localhost/chronos:dev
+    # entrypoint, not command: the image's ENTRYPOINT is chronos-server, and a
+    # command would be appended to it as an argument rather than replacing it.
+    entrypoint: ["/usr/local/bin/chronos-worker"]
+    environment:
+      CHRONOS_SERVER_URL: http://chronos-server:8080
+      CHRONOS_TASK_QUEUE: default
+      CHRONOS_WORKER_CONCURRENCY: "4"
+      CHRONOS_LOG_LEVEL: info
+      # CHRONOS_WORKER_NAME is deliberately unset so each container derives its
+      # name from its hostname. A fixed name would make every replica upsert the
+      # same worker row and report as one worker.
+    depends_on:
+      chronos-server:
+        condition: service_healthy
+    # Scale with: podman-compose --profile app up -d --scale chronos-worker=3
+    scale: 2
+
+volumes:
+  chronos-pgdata: {}
