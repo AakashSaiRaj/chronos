@@ -14,13 +14,16 @@ import (
 )
 
 const executionColumns = `id, definition_id, workflow_name, workflow_version, state, task_queue,
-	input, output, error, idempotency_key, created_at, updated_at, started_at, completed_at`
+	input, output, error, idempotency_key, traceparent, created_at, updated_at, started_at, completed_at`
 
 // StartExecutionParams describes a requested workflow run.
 type StartExecutionParams struct {
 	Definition     *domain.WorkflowDefinition
 	Input          json.RawMessage
 	IdempotencyKey string
+	// Traceparent ties every later span for this workflow back to the request
+	// that started it.
+	Traceparent string
 }
 
 // CreateExecution durably records a new execution in PENDING.
@@ -49,13 +52,14 @@ func (s *Store) CreateExecution(ctx context.Context, p StartExecutionParams) (ex
 
 	row := s.db.QueryRow(ctx, `
 		INSERT INTO workflow_executions
-			(id, definition_id, workflow_name, workflow_version, state, task_queue, input, idempotency_key)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			(id, definition_id, workflow_name, workflow_version, state, task_queue,
+			 input, idempotency_key, traceparent)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (workflow_name, idempotency_key) WHERE idempotency_key IS NOT NULL
 		DO NOTHING
 		RETURNING `+executionColumns,
 		uuid.New(), p.Definition.ID, p.Definition.Name, p.Definition.Version,
-		domain.WorkflowPending, p.Definition.TaskQueue, input, keyArg)
+		domain.WorkflowPending, p.Definition.TaskQueue, input, keyArg, p.Traceparent)
 
 	inserted, err := scanExecution(row)
 	if err == nil {
@@ -255,7 +259,7 @@ func scanExecution(row scanner) (*domain.WorkflowExecution, error) {
 	if err := row.Scan(
 		&exec.ID, &exec.DefinitionID, &exec.WorkflowName, &exec.WorkflowVersion,
 		&state, &exec.TaskQueue, &input, &output, &exec.Error, &idemKey,
-		&created, &updated, &started, &completed,
+		&exec.Traceparent, &created, &updated, &started, &completed,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("%w", domain.ErrNotFound)

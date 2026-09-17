@@ -24,6 +24,7 @@ import (
 	"github.com/AakashSaiRaj/chronos/internal/config"
 	"github.com/AakashSaiRaj/chronos/internal/engine"
 	"github.com/AakashSaiRaj/chronos/internal/store"
+	"github.com/AakashSaiRaj/chronos/internal/telemetry"
 )
 
 // version is injected at build time via -ldflags "-X main.version=...". It is
@@ -121,7 +122,36 @@ func run() error {
 	defer stop()
 
 	logger.Info("starting chronos-server",
-		"version", cfg.Version, "addr", cfg.HTTPAddr, "engineEnabled", cfg.EngineEnabled)
+		"version", cfg.Version, "addr", cfg.HTTPAddr,
+		"engineEnabled", cfg.EngineEnabled, "reaperEnabled", cfg.ReaperEnabled,
+		"metricsEnabled", cfg.Telemetry.MetricsEnabled,
+		"tracingEnabled", cfg.Telemetry.TracingEnabled)
+
+	// Telemetry comes up before the database, so a failure connecting to
+	// PostgreSQL is itself traced and counted rather than invisible.
+	var metrics *telemetry.Metrics
+	if cfg.Telemetry.MetricsEnabled {
+		metrics = telemetry.NewMetrics()
+	}
+
+	tracing, err := telemetry.InitTracing(telemetry.TracingConfig{
+		Enabled:        cfg.Telemetry.TracingEnabled,
+		ServiceName:    cfg.Telemetry.ServiceName,
+		ServiceVersion: cfg.Version,
+		Environment:    cfg.Telemetry.Environment,
+		SampleRatio:    cfg.Telemetry.TraceSampleRatio,
+		Exporter:       cfg.Telemetry.TraceExporter,
+	}, logger)
+	if err != nil {
+		return fmt.Errorf("init tracing: %w", err)
+	}
+	defer func() {
+		// Flushed on the way out: with a batching exporter, the spans describing
+		// whatever went wrong just before shutdown are the ones still buffered.
+		if err := tracing.Shutdown(context.Background()); err != nil {
+			logger.Warn("flushing traces failed", "error", err)
+		}
+	}()
 
 	db, err := store.Open(ctx, store.Config{
 		DatabaseURL:     cfg.DatabaseURL,
@@ -145,6 +175,7 @@ func run() error {
 	eng := engine.New(db, engine.Config{
 		PollInterval: cfg.EnginePollInterval,
 		BatchSize:    cfg.EngineBatchSize,
+		Metrics:      metrics,
 	}, logger)
 
 	// The reaper handles the failures a worker cannot report: it reclaims tasks
@@ -154,14 +185,23 @@ func run() error {
 		Interval:      cfg.ReaperInterval,
 		BatchSize:     cfg.ReaperBatchSize,
 		WorkerTimeout: cfg.WorkerTimeout,
+		Metrics:       metrics,
 	}, eng, logger)
+
+	// Publishes the gauges that can only be answered by querying the database:
+	// queue depth, backlog age, task and execution counts.
+	observer := engine.NewObserver(db, metrics, engine.ObserverConfig{
+		Interval: cfg.ObserverInterval,
+	}, logger)
 
 	// The service nudges the engine after durable writes so scheduling latency
 	// is not bounded by the poll interval.
-	svc := engine.NewService(db, eng, logger)
+	svc := engine.NewService(db, eng, logger).WithMetrics(metrics)
 	srv := api.NewHTTPServer(cfg.HTTPAddr, api.NewServer(svc, api.Options{
-		Logger:  logger,
-		Version: cfg.Version,
+		Logger:      logger,
+		Version:     cfg.Version,
+		Metrics:     metrics,
+		ServiceName: cfg.Telemetry.ServiceName,
 	}))
 
 	// Bind before declaring startup complete, so a port conflict fails fast
@@ -172,7 +212,7 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 
 	if cfg.EngineEnabled {
 		wg.Add(1)
@@ -196,6 +236,18 @@ func run() error {
 		}()
 	} else {
 		logger.Warn("reaper disabled; expired leases and dead workers will not be detected")
+	}
+
+	if metrics != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := observer.Run(ctx); err != nil {
+				// Losing gauges is a monitoring outage, not an availability one, so
+				// it must not take the process down with it.
+				logger.Error("metrics observer stopped", "error", err)
+			}
+		}()
 	}
 
 	wg.Add(1)

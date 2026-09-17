@@ -19,9 +19,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/AakashSaiRaj/chronos/internal/domain"
 	"github.com/AakashSaiRaj/chronos/internal/store"
+	"github.com/AakashSaiRaj/chronos/internal/telemetry"
 )
 
 // Config tunes the scheduling loop.
@@ -32,6 +34,10 @@ type Config struct {
 	PollInterval time.Duration
 	// BatchSize bounds how many executions one sweep considers.
 	BatchSize int
+	// Metrics is optional. A nil value disables instrumentation rather than
+	// requiring every call site to branch, which is what keeps the scheduling code
+	// readable.
+	Metrics *telemetry.Metrics
 	// Jitter is injectable so retry delays can be made exactly reproducible in
 	// tests. Note there is deliberately no injectable clock: every time-based
 	// decision is evaluated against the database clock, in the same statement as
@@ -126,8 +132,16 @@ func (e *Engine) Run(ctx context.Context) error {
 // Sweep performs one scheduling pass over all active executions. It is exported
 // so tests can drive the engine deterministically instead of waiting on timers.
 func (e *Engine) Sweep(ctx context.Context) error {
+	started := time.Now()
+	defer func() {
+		if e.cfg.Metrics != nil {
+			e.cfg.Metrics.EngineSweepDuration.Observe(time.Since(started).Seconds())
+		}
+	}()
+
 	ids, err := e.store.ListActiveExecutionIDs(ctx, e.cfg.BatchSize)
 	if err != nil {
+		e.recordSweepError()
 		return fmt.Errorf("list active executions: %w", err)
 	}
 
@@ -138,13 +152,24 @@ func (e *Engine) Sweep(ctx context.Context) error {
 		}
 		if err := e.ProcessExecution(ctx, id); err != nil {
 			// One poisoned execution must not stall the others.
+			e.recordSweepError()
 			e.logger.Error("advance execution failed", "executionId", id, "error", err)
 			if firstErr == nil {
 				firstErr = err
 			}
+			continue
+		}
+		if e.cfg.Metrics != nil {
+			e.cfg.Metrics.EngineSweepExecutions.Inc()
 		}
 	}
 	return firstErr
+}
+
+func (e *Engine) recordSweepError() {
+	if e.cfg.Metrics != nil {
+		e.cfg.Metrics.EngineSweepErrors.Inc()
+	}
 }
 
 // ProcessExecution advances a single execution as far as it can go right now.
@@ -222,8 +247,23 @@ func (e *Engine) startExecution(
 		return nil, err
 	}
 
+	if e.cfg.Metrics != nil {
+		e.cfg.Metrics.WorkflowsStarted.WithLabelValues(def.Name).Inc()
+	}
+
+	// The span is created under the execution's stored trace context, so it lands
+	// in the trace of the request that started the workflow rather than in a
+	// disconnected one belonging to this sweep.
+	spanCtx := telemetry.ContextFromTraceparent(ctx, exec.Traceparent)
+	_, span := telemetry.Start(spanCtx, "engine.startExecution",
+		telemetry.WorkflowAttr(def.Name),
+		telemetry.ExecutionAttr(exec.ID),
+		attributeInt("chronos.tasks_created", inserted))
+	telemetry.End(span, nil)
+
 	e.logger.Info("execution started",
-		"executionId", exec.ID, "workflow", def.Name, "version", def.Version, "tasks", inserted)
+		"executionId", exec.ID, "workflow", def.Name, "version", def.Version,
+		"tasks", inserted, "traceId", telemetry.TraceIDFrom(spanCtx))
 	return running, nil
 }
 
@@ -356,6 +396,10 @@ func (e *Engine) processFailedTasks(
 			}); err != nil {
 				return changed, err
 			}
+			if e.cfg.Metrics != nil {
+				e.cfg.Metrics.TasksDeadLettered.
+					WithLabelValues(exec.WorkflowName, t.Activity, string(reason)).Inc()
+			}
 			e.logger.Warn("task dead-lettered",
 				"executionId", exec.ID, "task", t.Name,
 				"attempt", t.Attempt, "retryable", t.Retryable, "error", t.Error)
@@ -389,6 +433,15 @@ func (e *Engine) processFailedTasks(
 			},
 		}); err != nil {
 			return changed, err
+		}
+
+		if e.cfg.Metrics != nil {
+			reason := t.LastFailureReason
+			if reason == "" {
+				reason = string(domain.FailureActivityError)
+			}
+			e.cfg.Metrics.TaskRetries.
+				WithLabelValues(exec.WorkflowName, t.Activity, reason).Inc()
 		}
 
 		e.logger.Info("task retry scheduled",
@@ -463,6 +516,9 @@ func (e *Engine) scheduleReadyTasks(
 		}
 
 		scheduled++
+		if e.cfg.Metrics != nil {
+			e.cfg.Metrics.TasksScheduled.WithLabelValues(exec.WorkflowName, t.Activity).Inc()
+		}
 		e.logger.Debug("task scheduled",
 			"executionId", exec.ID, "task", t.Name, "activity", t.Activity)
 	}
@@ -507,8 +563,37 @@ func (e *Engine) completeExecution(
 		return err
 	}
 
+	e.observeWorkflowFinished(ctx, exec, def.Name, domain.WorkflowCompleted)
 	e.logger.Info("execution completed", "executionId", exec.ID, "workflow", def.Name)
 	return nil
+}
+
+// observeWorkflowFinished records the terminal counters and the end-to-end
+// duration.
+//
+// Duration is measured from CreatedAt, not StartedAt: what a caller experiences
+// is the time from submitting the workflow to it finishing, and the gap before the
+// engine picked it up is part of that whether or not the engine considers it work.
+func (e *Engine) observeWorkflowFinished(
+	ctx context.Context,
+	exec *domain.WorkflowExecution,
+	workflow string,
+	state domain.WorkflowState,
+) {
+	if e.cfg.Metrics == nil {
+		return
+	}
+	e.cfg.Metrics.WorkflowsFinished.WithLabelValues(workflow, string(state)).Inc()
+	e.cfg.Metrics.WorkflowDuration.
+		WithLabelValues(workflow, string(state)).
+		Observe(time.Since(exec.CreatedAt).Seconds())
+
+	spanCtx := telemetry.ContextFromTraceparent(ctx, exec.Traceparent)
+	_, span := telemetry.Start(spanCtx, "engine.finishExecution",
+		telemetry.WorkflowAttr(workflow),
+		telemetry.ExecutionAttr(exec.ID),
+		telemetry.StateAttr(string(state)))
+	telemetry.End(span, nil)
 }
 
 // failExecution finalizes a run that cannot progress.
@@ -551,6 +636,7 @@ func (e *Engine) failExecution(
 		return err
 	}
 
+	e.observeWorkflowFinished(ctx, exec, exec.WorkflowName, domain.WorkflowFailed)
 	e.logger.Warn("execution failed",
 		"executionId", exec.ID, "task", failed.Name,
 		"failureReason", failed.LastFailureReason, "error", failed.Error)
@@ -587,4 +673,9 @@ func buildTaskInput(
 		}
 	}
 	return json.Marshal(payload)
+}
+
+// attributeInt is a small helper so instrumentation call sites stay one line.
+func attributeInt(key string, value int) attribute.KeyValue {
+	return attribute.Int(key, value)
 }

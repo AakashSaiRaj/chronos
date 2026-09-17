@@ -66,6 +66,11 @@ type Config struct {
 	MaxRetries int
 	Logger     *slog.Logger
 	HTTPClient *http.Client
+	// WrapTransport decorates the client's tuned transport, rather than replacing
+	// it. Used to inject trace propagation without the client knowing about
+	// tracing -- and without losing the connection-pool settings below, which
+	// matter because a worker polls continuously.
+	WrapTransport func(http.RoundTripper) http.RoundTripper
 }
 
 // Client talks to a Chronos server.
@@ -94,20 +99,21 @@ func New(cfg Config) (*Client, error) {
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{
-			Timeout: cfg.Timeout,
-			Transport: &http.Transport{
-				// Workers poll continuously, so connection reuse matters more
-				// here than in a typical client.
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 32,
-				IdleConnTimeout:     90 * time.Second,
-				DialContext: (&net.Dialer{
-					Timeout:   5 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-			},
+		var transport http.RoundTripper = &http.Transport{
+			// Workers poll continuously, so connection reuse matters more
+			// here than in a typical client.
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 32,
+			IdleConnTimeout:     90 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout:   5 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
 		}
+		if cfg.WrapTransport != nil {
+			transport = cfg.WrapTransport(transport)
+		}
+		httpClient = &http.Client{Timeout: cfg.Timeout, Transport: transport}
 	}
 
 	return &Client{
@@ -274,6 +280,11 @@ type TaskResponse struct {
 	UpdatedAt      time.Time        `json:"updatedAt"`
 	StartedAt      *time.Time       `json:"startedAt,omitempty"`
 	CompletedAt    *time.Time       `json:"completedAt,omitempty"`
+
+	// Traceparent is the parent workflow's W3C trace context, sent only on the
+	// poll response. The worker uses it to parent its activity span to the
+	// workflow's trace; empty when tracing is disabled server-side.
+	Traceparent string `json:"traceparent,omitempty"`
 }
 
 // PollRequest asks for the next task.

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/AakashSaiRaj/chronos/internal/domain"
 	"github.com/AakashSaiRaj/chronos/internal/store"
+	"github.com/AakashSaiRaj/chronos/internal/telemetry"
 )
 
 // DefaultLeaseDuration bounds how long a claimed task may be held before
@@ -39,6 +41,15 @@ type Service struct {
 	store    *store.Store
 	notifier Notifier
 	logger   *slog.Logger
+	// metrics is optional; nil disables instrumentation.
+	metrics *telemetry.Metrics
+}
+
+// WithMetrics returns a copy of the service that records metrics.
+func (svc *Service) WithMetrics(m *telemetry.Metrics) *Service {
+	clone := *svc
+	clone.metrics = m
+	return &clone
 }
 
 // NewService constructs a Service. A nil notifier is allowed and means state
@@ -120,10 +131,14 @@ func (svc *Service) StartExecution(ctx context.Context, req StartExecutionReques
 		return nil, false, err
 	}
 
+	// Capture the caller's trace context onto the row. This is the anchor every
+	// later span for this workflow descends from, across processes and across
+	// however long the workflow takes.
 	exec, created, err := svc.store.CreateExecution(ctx, store.StartExecutionParams{
 		Definition:     def,
 		Input:          req.Input,
 		IdempotencyKey: req.IdempotencyKey,
+		Traceparent:    telemetry.TraceparentFrom(ctx),
 	})
 	if err != nil {
 		return nil, false, err
@@ -131,7 +146,8 @@ func (svc *Service) StartExecution(ctx context.Context, req StartExecutionReques
 
 	if created {
 		svc.logger.Info("execution accepted",
-			"executionId", exec.ID, "workflow", def.Name, "version", def.Version)
+			"executionId", exec.ID, "workflow", def.Name, "version", def.Version,
+			"traceId", telemetry.TraceIDFrom(ctx))
 		svc.notifier.Nudge()
 	}
 	return exec, created, nil
@@ -330,9 +346,57 @@ func (svc *Service) PollTask(ctx context.Context, req PollRequest) (*domain.Task
 		return nil, err
 	}
 
+	// One read of the parent execution serves two purposes: the workflow name for
+	// metric labels, and the trace context the worker needs to place its activity
+	// span inside this workflow's trace.
+	//
+	// Deliberately outside the claim transaction. It is a primary-key lookup that
+	// neither the claim's correctness nor its locking depends on, so keeping it out
+	// leaves the transaction holding its row lock for as short a time as possible —
+	// and that lock duration is what bounds claim throughput under contention.
+	if exec, err := svc.store.GetExecution(ctx, claimed.ExecutionID); err == nil {
+		claimed.Traceparent = exec.Traceparent
+		svc.observeClaim(claimed, exec.WorkflowName)
+	} else {
+		// A claim must not fail because a metric label or a trace link could not be
+		// resolved. The task is already durably leased at this point; losing the
+		// label is a monitoring gap, losing the claim would be a correctness bug.
+		svc.logger.Warn("could not resolve execution for claimed task",
+			"taskId", claimed.ID, "executionId", claimed.ExecutionID, "error", err)
+		svc.observeClaim(claimed, "unknown")
+	}
+
 	svc.logger.Debug("task leased",
 		"taskId", claimed.ID, "task", claimed.Name, "worker", req.WorkerID, "attempt", claimed.Attempt)
 	return claimed, nil
+}
+
+// observeClaim records the queue wait: how long the task sat claimable before a
+// worker took it.
+//
+// This is the metric that answers "is the worker pool undersized", and it is only
+// measurable here because scheduled_at and the claim happen in different processes
+// — the worker cannot know when the task became eligible, and the engine cannot
+// know when it was taken.
+//
+// workflow is passed in rather than looked up. It used to be resolved by a helper
+// that issued its own GetExecution, which meant two extra round trips per claim
+// (the helper was called twice) on the hottest path in the system.
+func (svc *Service) observeClaim(task *domain.Task, workflow string) {
+	if svc.metrics == nil {
+		return
+	}
+	svc.metrics.TasksStarted.WithLabelValues(workflow, task.Activity).Inc()
+
+	if task.ScheduledAt != nil && task.StartedAt != nil {
+		// Measured against the claim's own timestamps, both written by the
+		// database, so the two ends of the interval share a clock.
+		if wait := task.UpdatedAt.Sub(*task.ScheduledAt); wait >= 0 {
+			svc.metrics.TaskQueueWait.
+				WithLabelValues(workflow, task.Activity).
+				Observe(wait.Seconds())
+		}
+	}
 }
 
 // CompleteTask records a successful task attempt and lets the engine schedule
@@ -340,6 +404,9 @@ func (svc *Service) PollTask(ctx context.Context, req PollRequest) (*domain.Task
 func (svc *Service) CompleteTask(ctx context.Context, taskID, claimToken uuid.UUID, output json.RawMessage) (*domain.Task, error) {
 	task, err := svc.reportTask(ctx, taskID, claimToken, domain.TaskCompleted, output, store.FailParams{})
 	if err != nil {
+		if errors.Is(err, domain.ErrStaleClaim) {
+			svc.observeStaleClaim("complete")
+		}
 		return nil, err
 	}
 	svc.notifier.Nudge()
@@ -354,6 +421,9 @@ func (svc *Service) CompleteTask(ctx context.Context, taskID, claimToken uuid.UU
 func (svc *Service) FailTask(ctx context.Context, taskID, claimToken uuid.UUID, p store.FailParams) (*domain.Task, error) {
 	task, err := svc.reportTask(ctx, taskID, claimToken, domain.TaskFailed, nil, p)
 	if err != nil {
+		if errors.Is(err, domain.ErrStaleClaim) {
+			svc.observeStaleClaim("fail")
+		}
 		return nil, err
 	}
 	svc.notifier.Nudge()
@@ -440,7 +510,46 @@ func (svc *Service) reportTask(
 		return nil, err
 	}
 
+	svc.observeReport(ctx, result, outcome)
 	svc.logger.Debug("task reported",
 		"taskId", result.ID, "task", result.Name, "state", result.State)
 	return result, nil
+}
+
+// workflowLabel resolves a task's workflow name for metric labels.
+//
+// A separate round trip rather than a SQL join on the task query: the name is
+// bounded-cardinality label data needed only by metrics, so widening the hot task
+// queries to carry it would be the wrong trade. Guarded by the caller's metrics
+// check, so it costs nothing when metrics are off.
+func (svc *Service) workflowLabel(ctx context.Context, task *domain.Task) string {
+	exec, err := svc.store.GetExecution(ctx, task.ExecutionID)
+	if err != nil {
+		return "unknown"
+	}
+	return exec.WorkflowName
+}
+
+// observeReport records a completed attempt's outcome and how long it ran.
+func (svc *Service) observeReport(ctx context.Context, task *domain.Task, outcome domain.TaskState) {
+	if svc.metrics == nil {
+		return
+	}
+	workflow := svc.workflowLabel(ctx, task)
+
+	svc.metrics.TasksFinished.WithLabelValues(workflow, task.Activity, string(outcome)).Inc()
+	if task.StartedAt != nil && task.CompletedAt != nil {
+		if d := task.CompletedAt.Sub(*task.StartedAt); d >= 0 {
+			svc.metrics.TaskDuration.
+				WithLabelValues(workflow, task.Activity, string(outcome)).
+				Observe(d.Seconds())
+		}
+	}
+}
+
+// observeStaleClaim records a report refused because the lease was gone.
+func (svc *Service) observeStaleClaim(operation string) {
+	if svc.metrics != nil {
+		svc.metrics.StaleClaimRejections.WithLabelValues(operation).Inc()
+	}
 }

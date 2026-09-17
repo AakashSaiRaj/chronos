@@ -12,6 +12,7 @@ import (
 
 	"github.com/AakashSaiRaj/chronos/internal/domain"
 	"github.com/AakashSaiRaj/chronos/internal/store"
+	"github.com/AakashSaiRaj/chronos/internal/telemetry"
 )
 
 // ReaperConfig tunes failure detection.
@@ -24,6 +25,8 @@ type ReaperConfig struct {
 	// declared dead. It should be several heartbeat intervals, so one dropped
 	// request cannot evict a healthy worker.
 	WorkerTimeout time.Duration
+	// Metrics is optional; nil disables instrumentation.
+	Metrics *telemetry.Metrics
 	// Jitter is injectable so requeue delays can be made reproducible in tests.
 	// There is deliberately no injectable clock: every expiry check is evaluated
 	// against the database clock, in the same statement as the write it guards.
@@ -136,6 +139,13 @@ func (r *Reaper) Run(ctx context.Context) error {
 func (r *Reaper) Sweep(ctx context.Context) (ReapStats, error) {
 	var stats ReapStats
 
+	started := time.Now()
+	defer func() {
+		if r.cfg.Metrics != nil {
+			r.cfg.Metrics.ReaperSweepDuration.Observe(time.Since(started).Seconds())
+		}
+	}()
+
 	// Declare dead workers first. Reclaiming their tasks immediately is faster
 	// than waiting for each individual lease to lapse, and it means the workflow
 	// resumes in seconds rather than after a full lease timeout.
@@ -154,6 +164,18 @@ func (r *Reaper) Sweep(ctx context.Context) (ReapStats, error) {
 	stats.TasksDeadLettered += leaseStats.TasksDeadLettered
 	if err != nil {
 		return stats, err
+	}
+
+	if m := r.cfg.Metrics; m != nil {
+		if stats.TasksRequeued > 0 {
+			m.ReaperReclaims.WithLabelValues("requeued").Add(float64(stats.TasksRequeued))
+		}
+		if stats.TasksDeadLettered > 0 {
+			m.ReaperReclaims.WithLabelValues("dead_lettered").Add(float64(stats.TasksDeadLettered))
+		}
+		if stats.WorkersDeclaredDead > 0 {
+			m.WorkersDeclaredDead.Add(float64(stats.WorkersDeclaredDead))
+		}
 	}
 
 	if stats.TasksRequeued > 0 || stats.TasksDeadLettered > 0 {
@@ -375,6 +397,9 @@ func (r *Reaper) reclaimTask(ctx context.Context, taskID uuid.UUID, cause domain
 			return err
 		}
 
+		if r.cfg.Metrics != nil {
+			r.cfg.Metrics.TaskLeaseExpiries.WithLabelValues(task.Activity, string(cause)).Inc()
+		}
 		outcome = reclaimRequeued
 		r.logger.Info("task requeued after worker loss",
 			"taskId", task.ID, "task", task.Name,

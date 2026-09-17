@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/AakashSaiRaj/chronos/internal/client"
 	"github.com/AakashSaiRaj/chronos/internal/config"
 	"github.com/AakashSaiRaj/chronos/internal/domain"
+	"github.com/AakashSaiRaj/chronos/internal/telemetry"
 )
 
 // Worker polls the control plane and executes activities.
@@ -25,9 +27,25 @@ type Worker struct {
 	registry *Registry
 	logger   *slog.Logger
 	health   *health
+	metrics  *telemetry.Metrics
+
+	// busySlots counts activities executing right now. Divided by configured
+	// concurrency this is worker utilization, which is the signal that says whether
+	// the pool is saturated -- distinct from queue depth, which says whether there
+	// is work waiting.
+	busySlots atomic.Int64
 
 	// id is assigned by the server at registration.
 	id uuid.UUID
+}
+
+// WithMetrics attaches a metric set to the worker.
+func (w *Worker) WithMetrics(m *telemetry.Metrics) *Worker {
+	w.metrics = m
+	if m != nil {
+		m.SetWorkerSlots(w.cfg.Concurrency, 0)
+	}
+	return w
 }
 
 // New constructs a Worker. The registry must be non-empty: a worker with no
@@ -137,6 +155,16 @@ func (w *Worker) pollLoop(ctx context.Context, slot int) {
 		}
 
 		task, err := w.poll(ctx)
+		if w.metrics != nil {
+			switch {
+			case err == nil:
+				w.metrics.WorkerPolls.WithLabelValues("task").Inc()
+			case errors.Is(err, client.ErrNoTask):
+				w.metrics.WorkerPolls.WithLabelValues("empty").Inc()
+			default:
+				w.metrics.WorkerPolls.WithLabelValues("error").Inc()
+			}
+		}
 		switch {
 		case err == nil:
 			// Reset backoff: the queue has work, so poll again immediately
@@ -214,17 +242,59 @@ func (w *Worker) execute(ctx context.Context, logger *slog.Logger, task *client.
 	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 
+	// Rejoin the workflow's trace.
+	//
+	// This is the point of persisting the traceparent on the execution row. The
+	// span opened here becomes a child of the request that started the workflow,
+	// however long ago and in whatever process — so one trace shows the whole
+	// workflow: acceptance, scheduling, and each activity attempt on whichever
+	// worker ran it. Without it, each attempt would be an orphan root span and the
+	// causal structure that makes a trace worth reading would be gone.
+	//
+	// Applied to runCtx, so the span is the parent of the activity's own work and
+	// of the outbound report call. Note runCtx derives from context.WithoutCancel,
+	// which strips cancellation but preserves values, so the span survives a
+	// shutdown signal exactly as the activity does.
+	runCtx = telemetry.ContextFromTraceparent(runCtx, task.Traceparent)
+	runCtx, span := telemetry.Start(runCtx, "activity."+task.Activity,
+		telemetry.ActivityAttr(task.Activity),
+		telemetry.TaskAttr(task.Name),
+		telemetry.ExecutionAttr(task.ExecutionID),
+		telemetry.AttemptAttr(task.Attempt),
+	)
+
 	// Renew the lease while the activity runs. Without this, every task would
 	// need a lease as long as the slowest possible activity, and a crashed
 	// worker's task would stay stuck for that entire duration. The same loop
 	// carries cancellation back from the control plane and cancels runCtx.
 	renewal := w.startLeaseRenewal(runCtx, logger, task, cancel)
 
+	// Utilization is tracked around the activity call itself, so it measures time
+	// actually spent executing rather than time spent polling.
+	busy := w.busySlots.Add(1)
+	if w.metrics != nil {
+		w.metrics.SetWorkerSlots(w.cfg.Concurrency, int(busy))
+	}
+
 	started := time.Now()
 	output, runErr := invoke(runCtx, fn, input)
 	elapsed := time.Since(started)
 
+	if remaining := w.busySlots.Add(-1); w.metrics != nil {
+		w.metrics.SetWorkerSlots(w.cfg.Concurrency, int(remaining))
+	}
+
 	canceled, leaseLost := renewal.stop()
+
+	// Ended before reporting, so the span's duration is the activity's execution
+	// time and not execution plus the round trip that reports it. The report gets
+	// its own child span from the instrumented transport.
+	telemetry.End(span, runErr)
+
+	// Report inside the traced context so the complete/fail call is a child of this
+	// activity span rather than a new root. ctx, not runCtx: report needs the
+	// original cancellation semantics, and takes its own timeout.
+	ctx = trace.ContextWithSpan(ctx, span)
 
 	switch {
 	case leaseLost:

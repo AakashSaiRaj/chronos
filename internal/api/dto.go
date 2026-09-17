@@ -192,6 +192,11 @@ type TaskResponse struct {
 	LeaseExpiryCount  int        `json:"leaseExpiryCount,omitempty"`
 	MaxLeaseExpiries  int        `json:"maxLeaseExpiries,omitempty"`
 	LastFailureReason string     `json:"lastFailureReason,omitempty"`
+
+	// Traceparent carries the parent workflow's W3C trace context, so a worker can
+	// open its activity span inside the workflow's trace rather than starting a
+	// disconnected one. Populated on the poll response only, like ClaimToken.
+	Traceparent string `json:"traceparent,omitempty"`
 }
 
 func newTaskResponse(t *domain.Task, includeClaimToken bool) TaskResponse {
@@ -226,6 +231,11 @@ func newTaskResponse(t *domain.Task, includeClaimToken bool) TaskResponse {
 	}
 	if includeClaimToken && t.ClaimToken != nil {
 		resp.ClaimToken = t.ClaimToken.String()
+		// Scoped to the same branch as the claim token: the trace context is only
+		// useful to the worker that just took the task, and only the poll response
+		// is addressed to it. Emitting it on every task read would leak trace
+		// context into operator-facing listings that have no use for it.
+		resp.Traceparent = t.Traceparent
 	}
 	return resp
 }

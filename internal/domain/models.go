@@ -35,10 +35,15 @@ type WorkflowExecution struct {
 	Output          json.RawMessage `json:"output,omitempty"`
 	Error           string          `json:"error,omitempty"`
 	IdempotencyKey  string          `json:"idempotencyKey,omitempty"`
-	CreatedAt       time.Time       `json:"createdAt"`
-	UpdatedAt       time.Time       `json:"updatedAt"`
-	StartedAt       *time.Time      `json:"startedAt,omitempty"`
-	CompletedAt     *time.Time      `json:"completedAt,omitempty"`
+	// Traceparent is the W3C trace context captured when the execution was
+	// accepted. Every span the workflow produces later, in whatever process,
+	// descends from it — see migration 0003 for why this has to be persisted
+	// rather than propagated.
+	Traceparent string     `json:"traceparent,omitempty"`
+	CreatedAt   time.Time  `json:"createdAt"`
+	UpdatedAt   time.Time  `json:"updatedAt"`
+	StartedAt   *time.Time `json:"startedAt,omitempty"`
+	CompletedAt *time.Time `json:"completedAt,omitempty"`
 }
 
 // Task is a single durable unit of work belonging to an execution.
@@ -90,6 +95,16 @@ type Task struct {
 	// LastFailureReason distinguishes an activity error from a lease expiry or a
 	// timeout, which the plain error string cannot.
 	LastFailureReason string `json:"lastFailureReason,omitempty"`
+
+	// Traceparent is the parent workflow execution's W3C trace context, copied
+	// onto the task when it is claimed. It is *not* a tasks column: it lives on
+	// workflow_executions and is attached here purely to hand it to the worker in
+	// the poll response, so the worker can open its activity span inside the
+	// workflow's trace instead of starting an orphan one.
+	//
+	// Populated only by PollTask. Every other read leaves it empty, which is
+	// harmless: nothing but the worker consumes it.
+	Traceparent string `json:"traceparent,omitempty"`
 }
 
 // HasAttemptsLeft reports whether the task has attempt budget remaining.

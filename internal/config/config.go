@@ -62,6 +62,28 @@ type Server struct {
 	ShutdownTimeout time.Duration
 	Version         string
 	Logging         Logging
+	Telemetry       Telemetry
+
+	// ObserverInterval is how often the database-derived queue gauges refresh.
+	ObserverInterval time.Duration
+}
+
+// Telemetry configures metrics and tracing, shared by both binaries.
+type Telemetry struct {
+	// MetricsEnabled exposes /metrics. On by default: a system whose queue depth
+	// cannot be observed cannot be operated.
+	MetricsEnabled bool
+	// TracingEnabled turns on span emission.
+	TracingEnabled bool
+	// TraceSampleRatio is head sampling probability. 1.0 in development; a busy
+	// production system wants a fraction of this.
+	TraceSampleRatio float64
+	// TraceExporter is "log" or "none".
+	TraceExporter string
+	// ServiceName distinguishes API, scheduler, and worker spans.
+	ServiceName string
+	// Environment tags spans so dev and prod traces stay separable.
+	Environment string
 }
 
 // Worker configures a task-executing process.
@@ -82,10 +104,12 @@ type Worker struct {
 	// declares no timeout.
 	TaskTimeout time.Duration
 
-	// HealthAddr is where the worker serves liveness and readiness probes. A
-	// worker has no other inbound surface, so without this Kubernetes has nothing
-	// to ask. Empty disables it.
+	// HealthAddr is where the worker serves liveness and readiness probes, and its
+	// /metrics endpoint. A worker has no other inbound surface, so without this
+	// Kubernetes has nothing to ask and Prometheus has nothing to scrape.
 	HealthAddr string
+
+	Telemetry Telemetry
 
 	RequestTimeout  time.Duration
 	ShutdownTimeout time.Duration
@@ -145,7 +169,12 @@ func LoadServer() (Server, error) {
 	cfg.ShutdownTimeout, err = envDuration("CHRONOS_SHUTDOWN_TIMEOUT", 20*time.Second)
 	collect(err)
 
+	cfg.ObserverInterval, err = envDuration("CHRONOS_OBSERVER_INTERVAL", 5*time.Second)
+	collect(err)
+
 	cfg.Logging, err = loadLogging()
+	collect(err)
+	cfg.Telemetry, err = loadTelemetry("chronos-server")
 	collect(err)
 
 	if cfg.DatabaseURL == "" {
@@ -204,6 +233,8 @@ func LoadWorker() (Worker, error) {
 
 	cfg.Logging, err = loadLogging()
 	collect(err)
+	cfg.Telemetry, err = loadTelemetry("chronos-worker")
+	collect(err)
 
 	if cfg.ServerURL == "" {
 		problems = append(problems, "CHRONOS_SERVER_URL must not be empty")
@@ -223,6 +254,60 @@ func LoadWorker() (Worker, error) {
 		return Worker{}, fmt.Errorf("invalid worker configuration: %s", strings.Join(problems, "; "))
 	}
 	return cfg, nil
+}
+
+// loadTelemetry reads the observability settings shared by both binaries.
+func loadTelemetry(defaultService string) (Telemetry, error) {
+	var problems []string
+
+	t := Telemetry{
+		ServiceName:   envString("CHRONOS_SERVICE_NAME", defaultService),
+		Environment:   envString("CHRONOS_ENVIRONMENT", "local"),
+		TraceExporter: strings.ToLower(envString("CHRONOS_TRACE_EXPORTER", "log")),
+	}
+
+	var err error
+	// Metrics default on: a workflow engine whose queue depth cannot be observed
+	// cannot be operated. Tracing defaults off because at ratio 1.0 it emits a log
+	// line per span, which is a deliberate choice rather than a default.
+	t.MetricsEnabled, err = envBool("CHRONOS_METRICS_ENABLED", true)
+	if err != nil {
+		problems = append(problems, err.Error())
+	}
+	t.TracingEnabled, err = envBool("CHRONOS_TRACING_ENABLED", false)
+	if err != nil {
+		problems = append(problems, err.Error())
+	}
+
+	t.TraceSampleRatio, err = envFloat("CHRONOS_TRACE_SAMPLE_RATIO", 1.0, 0, 1)
+	if err != nil {
+		problems = append(problems, err.Error())
+	}
+
+	if t.TraceExporter != "log" && t.TraceExporter != "none" {
+		problems = append(problems,
+			fmt.Sprintf("CHRONOS_TRACE_EXPORTER must be 'log' or 'none', got %q", t.TraceExporter))
+	}
+
+	if len(problems) > 0 {
+		return Telemetry{}, fmt.Errorf("%s", strings.Join(problems, "; "))
+	}
+	return t, nil
+}
+
+func envFloat(key string, def, min, max float64) (float64, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a number, got %q", key, raw)
+	}
+	if v < min || v > max {
+		return 0, fmt.Errorf("%s must be between %g and %g, got %g", key, min, max, v)
+	}
+	return v, nil
 }
 
 func loadLogging() (Logging, error) {

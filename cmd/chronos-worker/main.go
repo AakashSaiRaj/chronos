@@ -16,6 +16,7 @@ import (
 
 	"github.com/AakashSaiRaj/chronos/internal/client"
 	"github.com/AakashSaiRaj/chronos/internal/config"
+	"github.com/AakashSaiRaj/chronos/internal/telemetry"
 	"github.com/AakashSaiRaj/chronos/internal/worker"
 	"github.com/AakashSaiRaj/chronos/internal/worker/activities"
 )
@@ -53,9 +54,36 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	var metrics *telemetry.Metrics
+	if cfg.Telemetry.MetricsEnabled {
+		metrics = telemetry.NewMetrics()
+	}
+
+	tracing, err := telemetry.InitTracing(telemetry.TracingConfig{
+		Enabled:        cfg.Telemetry.TracingEnabled,
+		ServiceName:    cfg.Telemetry.ServiceName,
+		ServiceVersion: version,
+		Environment:    cfg.Telemetry.Environment,
+		SampleRatio:    cfg.Telemetry.TraceSampleRatio,
+		Exporter:       cfg.Telemetry.TraceExporter,
+	}, logger)
+	if err != nil {
+		return fmt.Errorf("init tracing: %w", err)
+	}
+	defer func() {
+		if err := tracing.Shutdown(context.Background()); err != nil {
+			logger.Warn("flushing traces failed", "error", err)
+		}
+	}()
+
 	api, err := client.New(client.Config{
 		BaseURL: cfg.ServerURL,
 		Timeout: cfg.RequestTimeout,
+		// Instrumented transport: the traceparent header is injected on every
+		// outbound call, so a worker's spans join the control plane's trace rather
+		// than forming an island. Wrapping preserves the client's connection-pool
+		// tuning, which a polling worker depends on.
+		WrapTransport: telemetry.InstrumentTransport,
 		// Retries are safe because every mutating call is idempotent: task
 		// reports are guarded by their claim token.
 		MaxRetries: 3,
@@ -71,6 +99,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	w = w.WithMetrics(metrics)
 
 	// Probes come up before anything that can block. A worker waiting for the
 	// control plane during a cold start must answer liveness (the process is

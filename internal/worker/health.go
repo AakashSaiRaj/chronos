@@ -115,8 +115,17 @@ func (w *Worker) ServeHealth(ctx context.Context) error {
 	}
 	w.logger.Info("worker health endpoint listening", "addr", listener.Addr().String())
 
+	mux := http.NewServeMux()
+	mux.Handle("/", w.health.handler(w.logger))
+	if w.metrics != nil {
+		// Served on the same port as the probes. A worker has no other inbound
+		// surface, and a second listener would mean a second Service and a second
+		// thing to misconfigure.
+		mux.Handle("GET /metrics", w.metrics.MetricsHandler(w.logger))
+	}
+
 	srv := &http.Server{
-		Handler:           w.health.handler(w.logger),
+		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
