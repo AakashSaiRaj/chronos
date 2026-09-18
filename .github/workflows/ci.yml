@@ -100,6 +100,43 @@ jobs:
           path: coverage.out
           retention-days: 7
 
+      - name: Validate observability configuration
+        # A dashboard that references a metric Chronos does not export is worse
+        # than no dashboard: the panel renders empty and reads as "no traffic"
+        # rather than "wrong query". Nothing at runtime catches that, because
+        # Prometheus is perfectly happy to return no data for a typo. This checks
+        # every chronos_* series named in the dashboard and the alert rules against
+        # the names actually registered in internal/telemetry.
+        run: |
+          jq -e . deploy/observability/grafana-dashboard.json > /dev/null
+
+          # Names as registered: the literals in metrics.go, plus the db_pool
+          # subsystem that the pool collector composes with BuildFQName.
+          {
+            grep -oE '"[a-z][a-z0-9_]*"' internal/telemetry/metrics.go \
+              | tr -d '"' | sed 's/^/chronos_/'
+            grep -oE 'newDesc\("[a-z_]+"' internal/engine/observer.go \
+              | sed 's/.*newDesc("//; s/"$//' | sed 's/^/chronos_db_pool_/'
+          } | sort -u > /tmp/registered.txt
+
+          # Names as referenced, with histogram and counter suffixes stripped back
+          # to the family name.
+          {
+            jq -r '[.panels[].targets[]?.expr] | join("\n")' \
+              deploy/observability/grafana-dashboard.json
+            cat deploy/k8s/base/monitoring.yaml
+          } | grep -oE 'chronos_[a-z_]+' \
+            | sed 's/_bucket$//; s/_count$//; s/_sum$//' \
+            | sort -u > /tmp/referenced.txt
+
+          missing="$(comm -23 /tmp/referenced.txt /tmp/registered.txt)"
+          if [ -n "${missing}" ]; then
+            echo "::error::dashboard or alerts reference metrics that are not registered:"
+            echo "${missing}"
+            exit 1
+          fi
+          echo "all $(wc -l < /tmp/referenced.txt) referenced metrics are registered"
+
   image:
     name: Build container image
     runs-on: ubuntu-latest
@@ -113,9 +150,14 @@ jobs:
         # runs with no network access, which the vendored dependencies make
         # possible and which guarantees nothing is pulled in at build time.
         run: |
+          # BUILD_PARALLELISM is raised above the Containerfile default here. That
+          # default is 2 because a local podman machine ships with 2 GiB and the Go
+          # compiler gets OOM-killed building the OpenTelemetry and pgx packages
+          # concurrently. A GitHub runner has ~7 GiB, so it can use its cores.
           docker build \
             --network=none \
             --build-arg VERSION="${GITHUB_SHA::12}" \
+            --build-arg BUILD_PARALLELISM=4 \
             -f Containerfile \
             -t "chronos:${GITHUB_SHA::12}" .
 

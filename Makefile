@@ -1,4 +1,4 @@
-# Chronos — Phase 1 developer workflow.
+# Chronos developer workflow.
 #
 # Containers are managed with podman / podman-compose.
 # Dependencies are vendored, so all Go commands work with no network access.
@@ -24,7 +24,7 @@ export CHRONOS_TEST_DATABASE_URL := $(DATABASE_URL)
 
 .PHONY: help
 help: ## Show available targets
-	@echo "Chronos — Phase 1"
+	@echo "Chronos — distributed workflow engine"
 	@echo
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| sort \
