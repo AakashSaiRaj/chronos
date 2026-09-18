@@ -256,6 +256,71 @@ func (c *Client) Heartbeat(ctx context.Context, workerID uuid.UUID) error {
 	return c.do(ctx, http.MethodPost, "/v1/workers/"+workerID.String()+"/heartbeat", nil, nil, nil)
 }
 
+// ExecutionFilter narrows a ListExecutions query.
+type ExecutionFilter struct {
+	WorkflowName string
+	State        domain.WorkflowState
+	Limit        int
+	Offset       int
+}
+
+// ListExecutions returns a page of executions matching the filter.
+//
+// Worth having alongside GetExecution: watching N executions reach a terminal
+// state costs one paged request here versus N individual reads, which matters as
+// soon as N is large enough to make the watcher itself a load source.
+func (c *Client) ListExecutions(ctx context.Context, f ExecutionFilter) ([]ExecutionResponse, error) {
+	path := "/v1/executions"
+	query := url.Values{}
+	if f.WorkflowName != "" {
+		query.Set("workflowName", f.WorkflowName)
+	}
+	if f.State != "" {
+		query.Set("state", string(f.State))
+	}
+	if f.Limit > 0 {
+		query.Set("limit", strconv.Itoa(f.Limit))
+	}
+	if f.Offset > 0 {
+		query.Set("offset", strconv.Itoa(f.Offset))
+	}
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+
+	var out struct {
+		Items []ExecutionResponse `json:"items"`
+		Count int                 `json:"count"`
+	}
+	if err := c.do(ctx, http.MethodGet, path, nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+// ListWorkers returns the registered workers, optionally filtered to one queue.
+//
+// Both the state and the queue matter to a caller deciding whether work will
+// actually be picked up: a queue with only DEAD workers accepts executions
+// happily and then never runs them.
+func (c *Client) ListWorkers(ctx context.Context, taskQueue string) ([]domain.Worker, error) {
+	path := "/v1/workers"
+	if taskQueue != "" {
+		query := url.Values{}
+		query.Set("taskQueue", taskQueue)
+		path += "?" + query.Encode()
+	}
+
+	var out struct {
+		Items []domain.Worker `json:"items"`
+		Count int             `json:"count"`
+	}
+	if err := c.do(ctx, http.MethodGet, path, nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
 // TaskResponse is a task as returned by the API. ClaimToken is populated only on
 // the poll response.
 type TaskResponse struct {

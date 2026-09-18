@@ -132,3 +132,44 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+---
+# Prometheus must be able to reach /metrics on all three components.
+#
+# Without this rule the default-deny above silently defeats the PodMonitors in
+# monitoring.yaml. The API happens to be reachable already, but only incidentally:
+# its 10.42.0.0/16 ingress rule exists for load balancer targets and would let a
+# scrape through as a side effect. The scheduler and the workers have no ingress
+# rule at all, so scraping them is impossible until this policy exists — and the
+# failure is quiet, appearing as permanently absent targets rather than an error
+# from anything in Chronos.
+#
+# Scoped to the metrics ports and to the monitoring namespace, so this opens the
+# scrape path and nothing else. In particular it does not make the scheduler's HTTP
+# port generally reachable; the scheduler still has no Service and still serves
+# nothing but probes and metrics.
+#
+# The namespace is selected by the `kubernetes.io/metadata.name` label that
+# Kubernetes sets automatically on every namespace. Override it in an overlay if
+# Prometheus lives somewhere other than `monitoring`.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-metrics-scrape
+  namespace: chronos
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: chronos
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        # 8080: API and scheduler. 8090: workers, which share one listener between
+        # their probes and their metrics.
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8090

@@ -1,0 +1,226 @@
+# Prometheus scrape configuration and alert rules.
+#
+# PodMonitors rather than ServiceMonitors, for all three components including the
+# API which does have a Service. Two reasons:
+#
+#   - Only the API has a Service at all. The scheduler and the workers have no
+#     inbound surface worth load balancing, so giving them Services purely to be
+#     scraped would create endpoints that invite traffic they are not built to
+#     serve.
+#   - A ServiceMonitor scrapes through a Service, so which replica answers is up to
+#     the load balancer. For per-replica gauges that is wrong: worker_slots_busy is
+#     a property of one process, and scraping "whichever worker the Service picked"
+#     would silently sample one replica and attribute it to all. PodMonitor scrapes
+#     every pod directly, which is the only way utilization per worker is real.
+#
+# These require the Prometheus Operator CRDs.
+#
+# They also require the `allow-metrics-scrape` NetworkPolicy in networkpolicy.yaml.
+# The namespace is default-deny, so without that rule these PodMonitors resolve to
+# targets that never answer — and nothing in Chronos reports an error, the targets
+# simply stay down. If metrics are missing after deploying, check that policy and
+# that Prometheus really is in the `monitoring` namespace it names.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: chronos-api
+  labels:
+    app.kubernetes.io/component: api
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chronos
+      app.kubernetes.io/component: api
+  podMetricsEndpoints:
+    # The API serves /metrics on its normal HTTP port. A separate admin port would
+    # be tidier, but it would also mean a second listener and a second thing to get
+    # wrong in a NetworkPolicy; the endpoint is read-only and the policy already
+    # restricts who can reach the port at all.
+    - port: http
+      path: /metrics
+      interval: 15s
+      # Shorter than the interval so a slow scrape is dropped rather than
+      # overlapping with the next one.
+      scrapeTimeout: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: chronos-scheduler
+  labels:
+    app.kubernetes.io/component: scheduler
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chronos
+      app.kubernetes.io/component: scheduler
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: chronos-worker
+  labels:
+    app.kubernetes.io/component: worker
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chronos
+      app.kubernetes.io/component: worker
+  podMetricsEndpoints:
+    # Workers publish /metrics on the same port as their probes. One listener, so
+    # there is no second port to forget in the NetworkPolicy.
+    - port: health
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+---
+# Alert rules.
+#
+# Deliberately few. Each one corresponds to a distinct operator action, because an
+# alert that does not tell you what to do is a notification, and a page nobody can
+# act on trains people to ignore the ones they can.
+#
+# What is *not* alerted on: error counts in isolation. Chronos is built to survive
+# individual failures -- a lease expiry, a stale claim rejection, a retried task
+# are all normal and self-healing. Alerting on them would fire constantly while the
+# system was working exactly as designed. The alerts below fire on conditions the
+# system cannot resolve by itself.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: chronos
+spec:
+  groups:
+    - name: chronos.availability
+      rules:
+        - alert: ChronosAPIDown
+          expr: |
+            sum(up{job=~"chronos.*", app_kubernetes_io_component="api"}) == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: No Chronos API replica is reachable
+            description: >-
+              Every API pod is failing to scrape. Workflows cannot be accepted and
+              workers cannot report results, so in-flight tasks will hold their
+              leases until they expire and then be retried. Check pod status and
+              database reachability.
+
+        - alert: ChronosNoActiveWorkers
+          expr: |
+            sum(chronos_workers_registered{state="ACTIVE"}) == 0
+            and sum(chronos_queue_depth) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Work is queued but no worker is alive to run it
+            description: >-
+              The queue is non-empty and no ACTIVE worker is registered. Executions
+              will be accepted and then sit indefinitely, which looks healthy from
+              the API's point of view. Both conditions are required: an empty queue
+              with no workers is an idle system, not an incident.
+
+    - name: chronos.saturation
+      rules:
+        # Depth alone is a poor signal: a large queue draining quickly is fine.
+        # Age is the one that distinguishes a busy system from a stuck one, which
+        # is why the alert is on age and depth is only context.
+        - alert: ChronosQueueNotDraining
+          expr: |
+            max(chronos_queue_oldest_claimable_age_seconds) > 300
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Tasks have been claimable for over 5 minutes
+            description: >-
+              The oldest claimable task has been waiting more than 5 minutes, so
+              the worker pool is not keeping up or is not polling the right queue.
+              Check worker utilization (chronos_worker_slots_busy over
+              chronos_worker_slots_total) before scaling: if utilization is low the
+              problem is not capacity.
+
+        - alert: ChronosWorkerPoolSaturated
+          expr: |
+            sum(chronos_worker_slots_busy) / sum(chronos_worker_slots_total) > 0.9
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Worker pool has been above 90% utilization for 15 minutes
+            description: >-
+              Sustained saturation. Unlike queue depth this says capacity really is
+              the constraint, so scaling the worker Deployment will help. A short
+              spike is normal and is why this waits 15 minutes.
+
+        - alert: ChronosDatabasePoolExhausted
+          expr: |
+            rate(chronos_db_pool_empty_acquires_total[5m]) > 10
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Requests are waiting for a database connection
+            description: >-
+              Callers are repeatedly finding the connection pool empty, which shows
+              up as latency well before it shows up as an error. Either the pool is
+              too small for the replica count or the database is slow. Note that
+              raising CHRONOS_DB_MAX_CONNS multiplies by replica count against the
+              database's own max_connections.
+
+    - name: chronos.correctness
+      rules:
+        # Dead letter is the one backlog nothing in Chronos will clear on its own:
+        # by construction these tasks have exhausted their retries and are waiting
+        # for a human to fix a cause and replay them.
+        - alert: ChronosDeadLetterGrowing
+          expr: |
+            chronos_dead_letter_depth > 0
+            and increase(chronos_tasks_dead_lettered_total[1h]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Tasks are being dead-lettered and are not being cleared
+            description: >-
+              Tasks have exhausted their retry budget and are parked for an
+              operator. Nothing will retry them automatically. Inspect with
+              GET /v1/dead-letter and replay after fixing the cause. The increase()
+              term means a static, already-acknowledged backlog does not keep
+              firing.
+
+        - alert: ChronosSchedulerStalled
+          expr: |
+            rate(chronos_engine_sweep_duration_seconds_count[5m]) == 0
+            and sum(chronos_workflow_executions{state="RUNNING"}) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: The scheduler has stopped sweeping while executions are running
+            description: >-
+              No engine sweep has completed recently and executions are in RUNNING.
+              Tasks will never become claimable, so the system is stalled rather
+              than slow. Nothing else detects this: the API stays healthy and the
+              queue stays empty, so every other signal looks fine.
+
+        - alert: ChronosEngineSweepsFailing
+          expr: |
+            rate(chronos_engine_sweep_errors_total[5m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Engine scheduling passes are failing
+            description: >-
+              Sweeps are erroring persistently, which almost always means the
+              database is unhappy. Individual failures are retried on the next pass
+              and are not worth waking anyone for, which is why this requires a
+              sustained rate.

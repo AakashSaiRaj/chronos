@@ -24,13 +24,22 @@ COPY internal ./internal
 
 # CGO_ENABLED=0 gives a static binary that runs on a distroless/scratch base.
 # -trimpath keeps build paths out of the binary; the ldflags strip debug info.
+#
+# BUILD_PARALLELISM caps concurrent compile actions. Go defaults to one per CPU,
+# and a podman machine is routinely provisioned with several CPUs but little RAM
+# (the default is 5 CPUs and 2 GiB). Compiling large packages — pgx/pgtype and the
+# OpenTelemetry SDK are the expensive ones here — five at a time exceeds 2 GiB and
+# the compiler is OOM-killed, which surfaces as a bare `signal: killed` that looks
+# nothing like a memory problem. Two at a time builds comfortably in 2 GiB; raise it
+# on a build host with more memory if the extra minute matters.
 ARG VERSION=dev
+ARG BUILD_PARALLELISM=2
 RUN --network=none \
     CGO_ENABLED=0 GOOS=linux GOFLAGS=-mod=vendor \
-    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+    go build -p "${BUILD_PARALLELISM}" -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
         -o /out/chronos-server ./cmd/chronos-server && \
     CGO_ENABLED=0 GOOS=linux GOFLAGS=-mod=vendor \
-    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+    go build -p "${BUILD_PARALLELISM}" -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
         -o /out/chronos-worker ./cmd/chronos-worker
 
 # ---------------------------------------------------------------------------

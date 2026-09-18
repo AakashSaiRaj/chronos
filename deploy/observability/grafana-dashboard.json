@@ -1,0 +1,376 @@
+{
+  "__comment": [
+    "Chronos operational dashboard.",
+    "",
+    "Laid out in the order an operator actually asks questions, not grouped by",
+    "metric type. Row 1 answers 'is it working' (throughput and backlog). Row 2",
+    "answers 'is it fast' (latency, split so queue wait is visible separately from",
+    "execution time, because they call for different responses). Row 3 answers 'why",
+    "is it slow' (worker utilization vs database saturation, the two candidates).",
+    "Row 4 answers 'is anything stuck' (dead letter and reliability counters).",
+    "",
+    "Import with: make observability-import, or paste into Grafana's import dialog.",
+    "Expects a Prometheus datasource; select it at import time."
+  ],
+  "title": "Chronos — Workflow Orchestration",
+  "uid": "chronos-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["chronos", "workflows"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Datasource",
+        "current": {}
+      },
+      {
+        "name": "workflow",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(chronos_workflow_executions_started_total, workflow)",
+        "label": "Workflow",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      },
+      {
+        "name": "task_queue",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(chronos_queue_depth, task_queue)",
+        "label": "Task queue",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Is it working?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Workflow throughput",
+      "description": "Workflows reaching a terminal state per second, split by outcome. A rising FAILED share is the first thing to notice; total rate alone would hide it.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "fillOpacity": 10, "stacking": { "mode": "normal" } } }
+      },
+      "targets": [
+        {
+          "expr": "sum by (state) (rate(chronos_workflow_executions_finished_total{workflow=~\"$workflow\"}[5m]))",
+          "legendFormat": "{{state}}"
+        },
+        {
+          "expr": "sum(rate(chronos_workflow_executions_started_total{workflow=~\"$workflow\"}[5m]))",
+          "legendFormat": "started"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue depth and backlog age",
+      "description": "Depth is how much work is waiting; age is how long the oldest piece has waited. Both are shown because depth alone cannot distinguish a large queue draining quickly from a small one that is stuck — age is what separates them, and it is the one the alert fires on.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "custom": { "fillOpacity": 10 } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "oldest claimable age" },
+            "properties": [
+              { "id": "unit", "value": "s" },
+              { "id": "custom.axisPlacement", "value": "right" }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "sum by (task_queue) (chronos_queue_depth{task_queue=~\"$task_queue\"})",
+          "legendFormat": "claimable — {{task_queue}}"
+        },
+        {
+          "expr": "sum by (task_queue) (chronos_queue_backoff_depth{task_queue=~\"$task_queue\"})",
+          "legendFormat": "awaiting retry backoff — {{task_queue}}"
+        },
+        {
+          "expr": "sum by (task_queue) (chronos_tasks_running{task_queue=~\"$task_queue\"})",
+          "legendFormat": "leased to a worker — {{task_queue}}"
+        },
+        {
+          "expr": "max(chronos_queue_oldest_claimable_age_seconds{task_queue=~\"$task_queue\"})",
+          "legendFormat": "oldest claimable age"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Is it fast?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue wait — how long a task sits before a worker takes it",
+      "description": "The queue's own latency, and the signal that says whether the worker pool is undersized. It rises when workers are the constraint and stays flat when they are not, which is what distinguishes it from end-to-end latency.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 10 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(chronos_task_queue_wait_seconds_bucket{workflow=~\"$workflow\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(chronos_task_queue_wait_seconds_bucket{workflow=~\"$workflow\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(chronos_task_queue_wait_seconds_bucket{workflow=~\"$workflow\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Task execution time",
+      "description": "Claim to reported outcome: the activity's own cost, excluding any time queued. Compare with queue wait above — if this is flat while queue wait climbs, the activities are fine and there simply are not enough workers.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 10 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(chronos_task_duration_seconds_bucket{workflow=~\"$workflow\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(chronos_task_duration_seconds_bucket{workflow=~\"$workflow\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(chronos_task_duration_seconds_bucket{workflow=~\"$workflow\"}[5m])))",
+          "legendFormat": "p99"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, activity) (rate(chronos_task_duration_seconds_bucket{workflow=~\"$workflow\"}[5m])))",
+          "legendFormat": "p95 — {{activity}}",
+          "hide": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "End-to-end workflow duration",
+      "description": "Acceptance to terminal state. For a task chain this is the sum of every task plus every scheduling gap between them, so it is legitimately orders of magnitude larger than any single task and should be read against the other two panels rather than alone.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 10 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(chronos_workflow_duration_seconds_bucket{workflow=~\"$workflow\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(chronos_workflow_duration_seconds_bucket{workflow=~\"$workflow\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(chronos_workflow_duration_seconds_bucket{workflow=~\"$workflow\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Why is it slow? — worker capacity vs database",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Worker utilization",
+      "description": "Busy slots over total slots across the fleet. This is the panel that decides whether scaling workers will help: high utilization with a growing queue means add workers, low utilization with a growing queue means the constraint is elsewhere and adding workers will make it worse.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 19 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.75 },
+              { "color": "red", "value": 0.9 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(chronos_worker_slots_busy) / sum(chronos_worker_slots_total)",
+          "legendFormat": "fleet utilization"
+        },
+        {
+          "expr": "sum by (pod) (chronos_worker_slots_busy) / sum by (pod) (chronos_worker_slots_total)",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Poll efficiency — the cost of an idle worker",
+      "description": "Chronos polls PostgreSQL for work, and an empty poll still costs a full transaction. This panel shows what share of polls find nothing. A high empty share means the fleet is spending database capacity asking whether there is work rather than doing it, and it is why tightening the poll interval can reduce throughput. Measured at 82% during the Phase 4 load test; see docs/PERFORMANCE.md.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 19 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } },
+      "targets": [
+        {
+          "expr": "sum(rate(chronos_worker_polls_total{outcome=\"empty\"}[5m])) / clamp_min(sum(rate(chronos_worker_polls_total[5m])), 0.001)",
+          "legendFormat": "polls that found nothing"
+        },
+        {
+          "expr": "sum(rate(chronos_worker_polls_total{outcome=\"error\"}[5m])) / clamp_min(sum(rate(chronos_worker_polls_total[5m])), 0.001)",
+          "legendFormat": "polls that errored"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Database latency and pool saturation",
+      "description": "Chronos uses PostgreSQL as its task queue, so claim latency is commit latency and this is the throughput ceiling made visible. Empty acquires are requests that waited for a free connection — that shows up as latency long before it shows up as an error, which is why it is worth a line of its own.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 19 },
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*(connections|acquires).*" },
+            "properties": [
+              { "id": "unit", "value": "short" },
+              { "id": "custom.axisPlacement", "value": "right" }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(chronos_db_query_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 — {{operation}}"
+        },
+        {
+          "expr": "sum(chronos_db_pool_acquired_connections)",
+          "legendFormat": "acquired connections"
+        },
+        {
+          "expr": "sum(chronos_db_pool_max_connections)",
+          "legendFormat": "pool ceiling"
+        },
+        {
+          "expr": "sum(rate(chronos_db_pool_empty_acquires_total[5m]))",
+          "legendFormat": "empty acquires/s"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Is anything stuck? — reliability",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 }
+    },
+    {
+      "type": "stat",
+      "title": "Dead letter depth",
+      "description": "Tasks that exhausted their retries and are waiting for a human. This is the one backlog Chronos will never clear on its own, which is why it gets a number of its own rather than a line on a graph.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 28 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "sum(chronos_dead_letter_depth)", "legendFormat": "dead letter" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Retries, lease expiries and reclaims",
+      "description": "All three are normal in small amounts and are how Chronos survives worker loss, so none of them is alerted on directly. What matters is the shape: a step change in lease expiries points at workers dying or at leases being too short for the activities they hold, and it is distinct from an activity that simply fails.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 12, "x": 6, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "targets": [
+        {
+          "expr": "sum(rate(chronos_task_retries_total{workflow=~\"$workflow\"}[5m]))",
+          "legendFormat": "retries (activity failed)"
+        },
+        {
+          "expr": "sum(rate(chronos_task_lease_expiries_total[5m]))",
+          "legendFormat": "lease expiries (worker vanished)"
+        },
+        {
+          "expr": "sum by (outcome) (rate(chronos_reaper_reclaims_total[5m]))",
+          "legendFormat": "reclaims — {{outcome}}"
+        },
+        {
+          "expr": "sum(rate(chronos_workers_declared_dead_total[5m]))",
+          "legendFormat": "workers declared dead"
+        },
+        {
+          "expr": "sum by (operation) (rate(chronos_stale_claim_rejections_total[5m]))",
+          "legendFormat": "stale claim refused — {{operation}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Scheduler health",
+      "description": "Sweep rate and duration. A sweep rate of zero while executions are RUNNING means the system is stalled rather than slow, and nothing else detects it: the API stays healthy and the queue stays empty, so every other signal on this dashboard looks fine.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 28 },
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*/s$" },
+            "properties": [
+              { "id": "unit", "value": "ops" },
+              { "id": "custom.axisPlacement", "value": "right" }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(chronos_engine_sweep_duration_seconds_bucket[5m])))",
+          "legendFormat": "sweep p95"
+        },
+        {
+          "expr": "sum(rate(chronos_engine_sweep_duration_seconds_count[5m]))",
+          "legendFormat": "sweeps/s"
+        },
+        {
+          "expr": "sum(rate(chronos_engine_sweep_errors_total[5m]))",
+          "legendFormat": "sweep errors/s"
+        }
+      ]
+    }
+  ]
+}

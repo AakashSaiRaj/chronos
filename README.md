@@ -5,9 +5,15 @@ tasks, start an execution, and a pool of workers executes the tasks in dependenc
 order. Every piece of state lives in PostgreSQL, so an execution survives the
 process that started it.
 
-**Phases 1–3 are complete**: a fault-tolerant workflow engine, plus the Terraform
-and Kubernetes configuration to run it on EKS with autoscaling workers. Phase 4
-adds observability — see [What's next](#whats-next).
+**All four phases are complete**: a fault-tolerant workflow engine, the Terraform
+and Kubernetes configuration to run it on EKS with autoscaling workers, and metrics,
+tracing, dashboards, alerts and a measured performance profile.
+
+Two documents hold the detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the
+design and the decisions behind it, and [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
+for the load test results — **66 workflows/s, 199 tasks/s peak, 6.2 s recovery from
+worker loss**, and a bottleneck analysis showing 82% of database work was workers
+asking an empty queue whether there was anything to do.
 
 One caveat stated up front: the Phase 3 infrastructure has been validated but never
 applied. No AWS account was used, so `terraform apply` has not run and nothing has
@@ -598,6 +604,32 @@ process fails immediately rather than at first use.
 | `CHRONOS_WORKER_LEASE_DURATION` | `30s` | server floors it at the task timeout |
 | `CHRONOS_WORKER_HEARTBEAT_INTERVAL` | `10s` | must be < lease duration |
 | `CHRONOS_WORKER_TASK_TIMEOUT` | `5m` | per-attempt bound when a task declares none |
+| `CHRONOS_WORKER_HEALTH_ADDR` | `:8090` | probes *and* `/metrics` share this listener |
+
+**Observability** (both binaries)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CHRONOS_METRICS_ENABLED` | `true` | on by default: a queue whose depth cannot be seen cannot be operated |
+| `CHRONOS_TRACING_ENABLED` | `false` | off by default because at ratio 1.0 it emits a line per span |
+| `CHRONOS_TRACE_SAMPLE_RATIO` | `1.0` | head sampling; the knob that controls span volume |
+| `CHRONOS_TRACE_EXPORTER` | `log` | `log` or `none` |
+| `CHRONOS_SERVICE_NAME` | per binary | distinguishes API, scheduler and worker spans |
+| `CHRONOS_ENVIRONMENT` | `local` | tags spans so dev and prod traces stay separable |
+| `CHRONOS_OBSERVER_INTERVAL` | `5s` | how often database-derived gauges refresh |
+
+Two behaviours worth knowing because they are not obvious:
+
+- The **span stream is not gated by `CHRONOS_LOG_LEVEL`**. It has its own logger and
+  is always JSON, because it is machine-consumed. Enabling tracing is already an
+  explicit request for the data; volume is controlled by the sample ratio. (Spans
+  used to go through the application logger at `Debug`, which meant a process at the
+  default `info` level exported every span into a discard.)
+- The **effective lease is `GREATEST(requested, task_timeout + 15s)`**, so raising
+  `CHRONOS_WORKER_LEASE_DURATION` does not shorten recovery for a long-running task —
+  its lease is already longer. Recovery for those is bounded by
+  `CHRONOS_WORKER_TIMEOUT` instead. Both paths are measured in
+  [PERFORMANCE.md](docs/PERFORMANCE.md#failure-recovery).
 
 Ports are non-default (`55432`, `8088`) and bound to loopback so Chronos does not
 collide with a system PostgreSQL or another local stack.
@@ -606,7 +638,7 @@ collide with a system PostgreSQL or another local stack.
 
 ## Testing
 
-318 tests, 77.2% statement coverage across `internal/...`.
+366 tests, 81.2% statement coverage across `internal/...`.
 
 ```bash
 make test              # unit only — no database, no containers
@@ -617,12 +649,14 @@ make cover             # HTML coverage report
 | Package | Coverage | What is tested |
 |---|---|---|
 | `internal/domain` | 97.0% | DAG validation, cycle detection, state machines, spec hashing, backoff curve |
-| `internal/api` | 84.0% | routing, decoding, error mapping, idempotency, token disclosure, DLQ, heartbeat |
-| `internal/store` | 75.9% | queue semantics, idempotency, locking, lease reclaim, worker liveness |
-| `internal/engine` | 60.2% | end-to-end execution, recovery, all failure scenarios, concurrency |
-| `internal/config` | 96.9% | env parsing and cross-field validation |
-| `internal/client` | 65.6% | retry classification, backoff, sentinel errors |
-| `internal/worker` | 31.8% | registry, activity input decoding |
+| `internal/telemetry` | 91.9% | metric registration, cardinality bounds, traceparent round trip, span export, scrape filtering |
+| `internal/config` | 90.9% | env parsing and cross-field validation |
+| `internal/worker/activities` | 87.8% | the example activities, including determinism under retry |
+| `internal/api` | 84.5% | routing, decoding, error mapping, idempotency, token disclosure, DLQ, heartbeat |
+| `internal/store` | 75.8% | queue semantics, idempotency, locking, lease reclaim, worker liveness, queue stats |
+| `internal/client` | 70.3% | retry classification, backoff, sentinel errors, query encoding |
+| `internal/engine` | 58.3% | end-to-end execution, recovery, all failure scenarios, concurrency, gauge refresh |
+| `internal/worker` | 48.1% | registry, input decoding, activity span parenting, slot accounting |
 
 Integration tests run against real PostgreSQL, not a fake, because the
 correctness argument rests on `SKIP LOCKED`, partial unique indexes, and row-level
@@ -671,20 +705,24 @@ Failure scenarios (`internal/engine/failure_integration_test.go`):
 ## Project layout
 
 ```
-cmd/chronos-server/        API + engine + reaper (and -migrate mode)
+cmd/chronos-server/        API + engine + reaper + observer (and -migrate mode)
 cmd/chronos-worker/        task executor
+cmd/chronos-loadtest/      load generator behind docs/PERFORMANCE.md
 internal/domain/           entities, state machines, DAG validation (no I/O)
-internal/store/            PostgreSQL: repositories, queue, migrations
-internal/engine/           scheduling loop, failure reaper, control-plane service
+internal/store/            PostgreSQL: repositories, queue, migrations, queue stats
+internal/engine/           scheduling loop, failure reaper, gauge observer, service
 internal/api/              HTTP transport
 internal/client/           Go SDK
 internal/worker/           poll loop, activity registry, example activities
 internal/config/           env configuration
+internal/telemetry/        metrics, tracing, HTTP instrumentation (leaf package)
 internal/testsupport/      integration test harness + failure injection helpers
+docs/                      ARCHITECTURE.md, PERFORMANCE.md
 scripts/                   demo.sh, recovery-demo.sh, failure-demo.sh,
-                           validate-deploy.sh
+                           trace-demo.sh, loadtest.sh, validate-deploy.sh
 deploy/terraform/          VPC, EKS, RDS, IAM/IRSA, ECR, optional Redis + SQS
-deploy/k8s/                Kustomize base + dev/prod overlays
+deploy/k8s/                Kustomize base + dev/prod overlays, PodMonitors, alerts
+deploy/observability/      Grafana dashboard
 .github/workflows/         ci.yml, cd.yml, terraform.yml
 ```
 
@@ -802,6 +840,38 @@ addition.
 | CI/CD via GitHub Actions | `ci.yml`, `cd.yml`, `terraform.yml` with OIDC |
 | Reproducible via Terraform | `make tf-plan ENV=dev` from a clean clone |
 
+### Phase 4
+
+| Requirement | Where |
+|---|---|
+| OpenTelemetry tracing | `internal/telemetry/tracing.go`; one trace per workflow across all three processes |
+| Trace across the durable queue | `traceparent` on `workflow_executions` (migration 0003), returned on poll |
+| Prometheus metrics | `/metrics` on API, scheduler and workers; ~32 series on a private registry |
+| Queue depth | `chronos_queue_depth` + `queue_backoff_depth` + `queue_oldest_claimable_age_seconds` |
+| Worker utilization | `chronos_worker_slots_busy` / `chronos_worker_slots_total`, per replica |
+| Retry and failure rates | `task_retries_total`, `task_lease_expiries_total`, `tasks_dead_lettered_total`, `reaper_reclaims_total` |
+| Latency histograms | queue wait, task duration, workflow duration, DB query — bucketed separately |
+| Structured logging | `slog`; span stream is separate, always JSON, tagged `stream=spans` |
+| Grafana dashboards | `deploy/observability/grafana-dashboard.json`, 15 panels |
+| Alerting | `deploy/k8s/base/monitoring.yaml` — 8 rules, each tied to an operator action |
+| Prometheus scrape config | 3 PodMonitors + the `allow-metrics-scrape` NetworkPolicy |
+| Load testing | `cmd/chronos-loadtest`, driven by `scripts/loadtest.sh` |
+| Documented throughput | 66 workflows/s, 199 tasks/s — [PERFORMANCE.md](docs/PERFORMANCE.md#headline-results) |
+| p50/p95/p99 latency | submit and end-to-end, per configuration |
+| Worker scaling behaviour | measured flat 1→4 workers, with the reason |
+| Recovery time measurement | 6.19 s via lease expiry, 45.40 s via worker-death detection |
+| Bottleneck analysis | 82% empty claim transactions; `LISTEN`/`NOTIFY` identified as the fix |
+| Architecture documentation | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+
+Try it:
+
+```bash
+make trace-demo   # one workflow, one 12-span trace, two processes
+make queue        # live queue depth, backlog age, pool saturation
+make loadtest     # the full performance suite
+make dashboard    # validate the Grafana JSON and list its panels
+```
+
 ### Known boundaries
 
 Stated plainly, because they are deliberate scope decisions rather than oversights:
@@ -820,8 +890,26 @@ Stated plainly, because they are deliberate scope decisions rather than oversigh
   failure non-retryable, but a workflow cannot declare "retry timeouts, not
   validation errors" declaratively.
 - **Single queue backend.** PostgreSQL only, by the reasoning above.
-- **No metrics or tracing yet.** Failure detection is observable through history
-  events and structured logs; Prometheus and OpenTelemetry are Phase 4.
+- **Spans go to the log stream, not OTLP.** A real exporter would pull in grpc,
+  protobuf and genproto, and this project vendors its dependencies so it builds with
+  no network access. The log exporter implements `sdktrace.SpanExporter`, so span
+  IDs, W3C propagation and parent links are all real and a collector's filelog
+  receiver can reconstruct OTLP; swapping in `otlptracegrpc` is a change to one
+  function. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#observability).
+- **Polling is the measured throughput ceiling.** 82% of claim transactions find an
+  empty queue and still cost a full PostgreSQL transaction, which is why adding
+  workers past the point where they keep up stops helping and tightening the poll
+  interval makes throughput worse. `LISTEN`/`NOTIFY` is the fix and is not
+  implemented: it is a Phase 1 architectural change rather than Phase 4
+  instrumentation. Fully measured in
+  [docs/PERFORMANCE.md](docs/PERFORMANCE.md#worker-scaling-it-doesnt-and-that-is-the-finding).
+- **Performance numbers are from one laptop.** PostgreSQL, the control plane and the
+  workers share 11 cores, so the absolute throughput is not a capacity planning
+  figure. The relative findings — which resource saturates first, how throughput
+  responds to workers — are the useful part.
+- **The worker HPA still scales on CPU.** Phase 4 produces the queue-depth signal
+  that should replace it (`chronos_queue_depth`), but wiring it up needs
+  prometheus-adapter or KEDA in the cluster, which has not been deployed.
 - **The infrastructure has never been applied.** Terraform validates and the
   manifests render, but no AWS account was used. `terraform validate` checks syntax
   and provider schemas; it does not catch an insufficient IAM policy, an IRSA trust
@@ -838,9 +926,23 @@ Stated plainly, because they are deliberate scope decisions rather than oversigh
 
 ## What's next
 
-- **Phase 4** — OpenTelemetry tracing, Prometheus metrics (queue depth, worker
-  utilization, retry and failure rates), Grafana dashboards, alerting, and load
-  testing with documented throughput, p50/p95/p99 latency, and measured recovery
-  time after worker failure. The metrics are also what would replace the HPA's
-  CPU proxy with a real queue-depth signal, and what should decide the RDS
-  instance class rather than the current guess.
+All four phases are done. What Phase 4's measurements say to do next, in the order
+the evidence supports:
+
+- **Replace polling with `LISTEN`/`NOTIFY`.** The measured ceiling: 82% of claim
+  transactions find nothing and still pay for a transaction, so idle workers consume
+  the capacity the scheduler needs. `Engine.Nudge()` is already the notification
+  point, so the change is confined to the poll path — and long-polling the existing
+  endpoint would capture most of the benefit without changing the client contract.
+- **Drive the worker HPA from queue depth instead of CPU.** `chronos_queue_depth`
+  now exists; it needs prometheus-adapter or KEDA in the cluster to become an
+  external metric. CPU is a poor proxy for an I/O-bound activity, which sits idle
+  while its queue grows.
+- **Size RDS from the DB metrics rather than by guess.** `db_query_duration_seconds`
+  and `db_pool_empty_acquires_total` are the inputs; the pool showed 3,980 empty
+  acquires under load, which suggests the current instance class and pool size were
+  chosen optimistically.
+- **Apply the infrastructure.** Still never run against a real AWS account, which
+  remains the largest untested surface in the project.
+- **Soak test.** Every run so far is seconds to tens of seconds. Nothing here says
+  anything about table growth, autovacuum behaviour, or a week of uptime.

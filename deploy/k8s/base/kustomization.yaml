@@ -17,6 +17,7 @@ resources:
   - scheduler.yaml
   - worker.yaml
   - networkpolicy.yaml
+  - monitoring.yaml
 
 commonLabels:
   app.kubernetes.io/name: chronos

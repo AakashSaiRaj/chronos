@@ -37,11 +37,12 @@ help: ## Show available targets
 # ---------------------------------------------------------------------------
 
 .PHONY: build
-build: ## Build both binaries into ./bin
+build: ## Build all three binaries into ./bin
 	@mkdir -p bin
 	go build -trimpath -ldflags="-X main.version=$(VERSION)" -o bin/chronos-server ./cmd/chronos-server
 	go build -trimpath -ldflags="-X main.version=$(VERSION)" -o bin/chronos-worker ./cmd/chronos-worker
-	@echo "built bin/chronos-server and bin/chronos-worker ($(VERSION))"
+	go build -trimpath -o bin/chronos-loadtest ./cmd/chronos-loadtest
+	@echo "built bin/chronos-server, bin/chronos-worker and bin/chronos-loadtest ($(VERSION))"
 
 .PHONY: fmt
 fmt: ## Format all Go source
@@ -76,7 +77,7 @@ clean: ## Remove build artifacts
 # the integration tests' self-skip, so `make test` is fast and deterministic even
 # when a Chronos PostgreSQL happens to be running.
 UNIT_PKGS := ./internal/domain/... ./internal/api/... ./internal/worker/... \
-             ./internal/config/... ./internal/client/...
+             ./internal/config/... ./internal/client/... ./internal/telemetry/...
 
 .PHONY: test
 test: ## Run unit tests (no database required)
@@ -164,6 +165,42 @@ recovery-demo: ## Kill the engine mid-workflow and show it resume from persisted
 .PHONY: failure-demo
 failure-demo: ## Kill a worker mid-task; show lease reclaim, retries, dead-letter, replay
 	./scripts/failure-demo.sh
+
+# ---------------------------------------------------------------------------
+# Observability and performance
+# ---------------------------------------------------------------------------
+
+.PHONY: metrics
+metrics: ## Show the Chronos metrics a running server is exporting
+	@curl -fsS $(SERVER_URL)/metrics | grep '^chronos_' | grep -v '^chronos_[a-z_]*_bucket'
+
+.PHONY: queue
+queue: ## Show live queue depth, backlog age and pool saturation
+	@curl -fsS $(SERVER_URL)/metrics | grep -E \
+		'^chronos_(queue_depth|queue_backoff_depth|queue_oldest_claimable_age_seconds|tasks_running|tasks\{|workflow_executions\{|dead_letter_depth|workers_registered|db_pool_)' \
+		|| echo "no queue metrics yet — is the server running with metrics enabled?"
+
+.PHONY: trace-demo
+trace-demo: ## Run one workflow with tracing on and print the resulting spans
+	./scripts/trace-demo.sh
+
+.PHONY: loadtest
+loadtest: ## Full performance suite: scaling, latency floor, saturation, recovery
+	./scripts/loadtest.sh $(EXECUTIONS)
+
+# Enough work to amortize per-run startup without making the suite slow.
+EXECUTIONS ?= 600
+
+.PHONY: loadtest-quick
+loadtest-quick: ## Shorter performance run, for checking the harness works
+	./scripts/loadtest.sh 100
+
+.PHONY: dashboard
+dashboard: ## Validate the Grafana dashboard JSON and list its panels
+	@jq -e . deploy/observability/grafana-dashboard.json >/dev/null \
+		&& echo "dashboard JSON is valid"
+	@jq -r '.panels[] | select(.type != "row") | "  \(.type)\t\(.title)"' \
+		deploy/observability/grafana-dashboard.json
 
 .PHONY: dlq
 dlq: ## Show the dead letter queue (needs a running server)

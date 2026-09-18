@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -313,4 +314,99 @@ func TestAPIErrorRetryableClassification(t *testing.T) {
 		err := &client.APIError{StatusCode: status}
 		require.Equal(t, retryable, err.Retryable(), "status %d", status)
 	}
+}
+
+// TestListExecutionsSendsFiltersAsQueryParameters pins a mistake that is easy to
+// make and silent when made: Client.do takes headers in the position that looks
+// like it should take query parameters. Passing a filter map there compiles, sends
+// the filter as HTTP headers, and leaves the request unfiltered -- so the caller
+// receives a default page of unrelated rows and no error. When the load generator
+// hit this, it waited forever for 600 executions it was never asking about.
+func TestListExecutionsSendsFiltersAsQueryParameters(t *testing.T) {
+	var gotQuery url.Values
+	var gotHeaders http.Header
+
+	c := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		gotHeaders = r.Header.Clone()
+		writeJSON(t, w, map[string]any{
+			"items": []map[string]any{{
+				"id":              uuid.New().String(),
+				"workflowName":    "order_pipeline",
+				"workflowVersion": 1,
+				"state":           string(domain.WorkflowCompleted),
+				"taskQueue":       "default",
+				"input":           json.RawMessage(`{}`),
+				"createdAt":       time.Now().UTC(),
+				"updatedAt":       time.Now().UTC(),
+			}},
+			"count": 1,
+		})
+	}), 0)
+
+	items, err := c.ListExecutions(context.Background(), client.ExecutionFilter{
+		WorkflowName: "order_pipeline",
+		State:        domain.WorkflowCompleted,
+		Limit:        500,
+		Offset:       500,
+	})
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+
+	require.Equal(t, "order_pipeline", gotQuery.Get("workflowName"))
+	require.Equal(t, "COMPLETED", gotQuery.Get("state"))
+	require.Equal(t, "500", gotQuery.Get("limit"))
+	require.Equal(t, "500", gotQuery.Get("offset"))
+
+	// The filter must not have leaked into the headers, which is where it went
+	// when this was wrong.
+	require.Empty(t, gotHeaders.Get("workflowName"))
+	require.Empty(t, gotHeaders.Get("limit"))
+}
+
+func TestListExecutionsOmitsEmptyFilters(t *testing.T) {
+	var gotRawQuery string
+	c := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRawQuery = r.URL.RawQuery
+		writeJSON(t, w, map[string]any{"items": []any{}, "count": 0})
+	}), 0)
+
+	items, err := c.ListExecutions(context.Background(), client.ExecutionFilter{})
+	require.NoError(t, err)
+	require.Empty(t, items)
+
+	// An unset filter must produce no parameter at all rather than an empty one,
+	// since the server treats a present-but-empty state as a validation error.
+	require.Empty(t, gotRawQuery)
+}
+
+func TestListWorkersFiltersByTaskQueue(t *testing.T) {
+	var gotQuery url.Values
+	c := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		writeJSON(t, w, map[string]any{
+			"items": []map[string]any{{
+				"id":         uuid.New().String(),
+				"name":       "worker-1",
+				"taskQueue":  "default",
+				"state":      string(domain.WorkerActive),
+				"activities": []string{"charge_payment"},
+			}},
+			"count": 1,
+		})
+	}), 0)
+
+	workers, err := c.ListWorkers(context.Background(), "default")
+	require.NoError(t, err)
+	require.Len(t, workers, 1)
+	require.Equal(t, "worker-1", workers[0].Name)
+	require.Equal(t, domain.WorkerActive, workers[0].State)
+	require.Equal(t, "default", gotQuery.Get("taskQueue"))
+}
+
+func writeJSON(t *testing.T, w http.ResponseWriter, body any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	require.NoError(t, json.NewEncoder(w).Encode(body))
 }

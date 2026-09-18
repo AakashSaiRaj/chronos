@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -318,6 +319,12 @@ func (svc *Service) PollTask(ctx context.Context, req PollRequest) (*domain.Task
 		claim.LeaseDuration = DefaultLeaseDuration
 	}
 
+	// Timed because this transaction is the system's throughput ceiling: Chronos
+	// uses PostgreSQL as its queue, so a claim is a row lock plus two writes, and
+	// every worker in the fleet contends on it. When throughput stops responding to
+	// added workers, this is the number that says why.
+	claimStarted := time.Now()
+
 	var claimed *domain.Task
 	err := svc.store.WithTx(ctx, func(tx *store.Store) error {
 		task, err := tx.ClaimTask(ctx, claim)
@@ -342,6 +349,12 @@ func (svc *Service) PollTask(ctx context.Context, req PollRequest) (*domain.Task
 		claimed = task
 		return nil
 	})
+
+	// Recorded for both outcomes. An empty queue still costs a transaction, and
+	// excluding those would hide the cost of a fleet polling an idle queue -- which
+	// is exactly the load that makes polling intervals matter.
+	svc.observeQuery("claim_task", claimStarted, err)
+
 	if err != nil {
 		return nil, err
 	}
@@ -447,6 +460,8 @@ func (svc *Service) reportTask(
 		return nil, fmt.Errorf("%w: claimToken is required to report a task result", domain.ErrValidation)
 	}
 
+	reportStarted := time.Now()
+
 	var result *domain.Task
 	err := svc.store.WithTx(ctx, func(tx *store.Store) error {
 		// Read the current row first so a replay can be told apart from a first
@@ -506,6 +521,12 @@ func (svc *Service) reportTask(
 		result = task
 		return nil
 	})
+
+	// Labelled by outcome so a complete and a fail are separable: they take
+	// different paths through the store and a retry write is not the same cost as
+	// a terminal one.
+	svc.observeQuery("report_task_"+strings.ToLower(string(outcome)), reportStarted, err)
+
 	if err != nil {
 		return nil, err
 	}
@@ -552,4 +573,17 @@ func (svc *Service) observeStaleClaim(operation string) {
 	if svc.metrics != nil {
 		svc.metrics.StaleClaimRejections.WithLabelValues(operation).Inc()
 	}
+}
+
+// observeQuery records how long a store transaction took.
+//
+// Only the data-plane transactions are instrumented, not every store call. The
+// claim and the report are the two operations every task passes through twice, so
+// they are what the throughput ceiling is made of; timing incidental reads as well
+// would add series without adding an answer.
+func (svc *Service) observeQuery(operation string, started time.Time, err error) {
+	if svc.metrics == nil {
+		return
+	}
+	svc.metrics.ObserveDBQuery(operation, time.Since(started), err)
 }
